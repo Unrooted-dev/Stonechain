@@ -22,9 +22,9 @@ fi
 
 # Binary starten (Debug oder Release je nach Argument)
 if [ "${1:-}" = "--release" ]; then
-    BINARY="$SCRIPT_DIR/target/release/server"
+    BINARY="$SCRIPT_DIR/target/release/stone-master"
 else
-    BINARY="$SCRIPT_DIR/target/debug/server"
+    BINARY="$SCRIPT_DIR/target/debug/stone-master"
 fi
 
 if [ ! -f "$BINARY" ]; then
@@ -34,4 +34,4 @@ if [ ! -f "$BINARY" ]; then
 fi
 
 echo "[stone] Starte: $BINARY"
-exec "$BINARY" "${@}"
+exec "$BINARY" "${@:2}"

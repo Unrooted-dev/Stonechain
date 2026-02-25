@@ -306,7 +306,21 @@ async fn handle_list_blocks(
     Query(q): Query<PaginationQuery>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, Response> {
-    require_admin(&headers, &state)?;
+    // Block-Liste ist für Peer-Sync öffentlich zugänglich.
+    // Wenn ein x-api-key gesetzt ist, muss er gültig sein (Admin oder User).
+    // Kein Key → trotzdem erlaubt (read-only, Blockchain-Daten sind öffentlich).
+    if let Some(key) = extract_api_key(&headers) {
+        if key != state.api_key.as_str() {
+            // Kein Admin-Key → als normalen User prüfen
+            if resolve_user_by_key(&key, &state.users, &state.api_key).is_none() {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    axum::Json(json!({"error": "Ungültiger API-Key"})),
+                )
+                    .into_response());
+            }
+        }
+    }
     let chain = state.node.chain.lock().unwrap();
     let per_page = q.per_page.unwrap_or(50).min(500) as usize;
     let page = q.page.unwrap_or(0) as usize;
@@ -336,7 +350,18 @@ async fn handle_get_block(
     Path(index): Path<u64>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, Response> {
-    require_admin(&headers, &state)?;
+    // Ebenfalls für Peer-Sync öffentlich (Block-Metadaten, kein Chunk-Inhalt)
+    if let Some(key) = extract_api_key(&headers) {
+        if key != state.api_key.as_str() {
+            if resolve_user_by_key(&key, &state.users, &state.api_key).is_none() {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    axum::Json(json!({"error": "Ungültiger API-Key"})),
+                )
+                    .into_response());
+            }
+        }
+    }
     let chain = state.node.chain.lock().unwrap();
     let block = chain
         .blocks

@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-STONE_DIR="/Users/leon/Desktop/stone"
+STONE_DIR="/Users/leon/Schreibtisch/stonechain"
 NOMAD_ENV="/Users/leon/forge-Nomad/.env"
 TOKEN_BIN="/tmp/stone-test/token.bin"
 
