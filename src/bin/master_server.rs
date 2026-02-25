@@ -14,8 +14,9 @@
 //!   GET    /api/v1/documents/:doc_id         – Dokument per ID
 //!   GET    /api/v1/documents/:doc_id/history – Versionshistorie
 //!   GET    /api/v1/documents/:doc_id/data    – Roh-Bytes (Chunk-Rekonstruktion)
-//!   POST   /api/v1/documents                 – Dokument hochladen (Multipart)
-//!   DELETE /api/v1/documents/:doc_id         – Soft-Delete
+//!   POST   /api/v1/documents                       – Dokument hochladen (Multipart)
+//!   POST   /api/v1/documents/:doc_id/transfer       – Eigentum übertragen
+//!   DELETE /api/v1/documents/:doc_id               – Soft-Delete
 //!   GET    /api/v1/peers                     – Peer-Liste
 //!   POST   /api/v1/peers                     – Peer hinzufügen
 //!   DELETE /api/v1/peers/:idx                – Peer entfernen
@@ -1034,6 +1035,159 @@ async fn handle_patch_document(
             "version": updated_doc.version,
             "block_index": block.index,
             "updated": true,
+        })),
+    ))
+}
+
+// ─── Dokument-Transfer ────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct TransferDocumentRequest {
+    /// Ziel-User-ID (nicht der Name, die interne ID)
+    to_user_id: String,
+}
+
+/// POST /api/v1/documents/:doc_id/transfer
+///
+/// Überträgt das Eigentum eines Dokuments an einen anderen Nutzer.
+///
+/// Regeln:
+///  - Nur der aktuelle Owner (oder Admin) darf übertragen.
+///  - Der Zielnutzer muss existieren.
+///  - Das Dokument darf nicht gelöscht sein.
+///  - Ein neuer Block wird mit dem aktualisierten `owner`-Feld committed.
+///  - Die Chunks/Bytes bleiben unverändert; nur Metadaten in der Chain ändern sich.
+async fn handle_transfer_document(
+    headers: HeaderMap,
+    Path(doc_id): Path<String>,
+    State(state): State<AppState>,
+    axum::Json(req): axum::Json<TransferDocumentRequest>,
+) -> Result<impl IntoResponse, Response> {
+    let caller = require_user(&headers, &state)?;
+
+    let to_id = req.to_user_id.trim().to_string();
+    if to_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "to_user_id darf nicht leer sein"})),
+        )
+            .into_response());
+    }
+
+    // Ziel-User muss existieren (oder ist "admin")
+    let target_exists = {
+        to_id == "admin"
+            || state
+                .users
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|u| u.id == to_id)
+    };
+    if !target_exists {
+        return Err((
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"error": format!("Zielnutzer '{}' nicht gefunden", to_id)})),
+        )
+            .into_response());
+    }
+
+    // Dokument laden + Zugriff prüfen
+    // Wir clonen sofort, damit der MutexGuard vor den ?-Propagierungen wegfällt.
+    let current_doc: Document = {
+        let chain = state.node.chain.lock().unwrap();
+        let maybe = chain.find_document(&doc_id).map(|(d, _)| d.clone());
+        drop(chain); // Lock explizit freigeben bevor wir Fehler propagieren
+        maybe.ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                axum::Json(json!({"error": "Dokument nicht gefunden"})),
+            )
+                .into_response()
+        })?
+    };
+
+    if current_doc.deleted {
+        return Err((
+            StatusCode::GONE,
+            axum::Json(json!({"error": "Dokument wurde gelöscht"})),
+        )
+            .into_response());
+    }
+    if caller.id != "admin" && current_doc.owner != caller.id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({"error": "Nur der Eigentümer kann ein Dokument übertragen"})),
+        )
+            .into_response());
+    }
+    if current_doc.owner == to_id {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "Dokument gehört diesem Nutzer bereits"})),
+        )
+            .into_response());
+    }
+
+    // Neues Dokument-Objekt mit aktualisiertem Owner + erhöhter Version
+    let transferred_doc = Document {
+        owner:      to_id.clone(),
+        version:    current_doc.version + 1,
+        updated_at: chrono::Utc::now().timestamp(),
+        // Alle übrigen Felder beibehalten
+        doc_id:          current_doc.doc_id.clone(),
+        title:           current_doc.title.clone(),
+        content_type:    current_doc.content_type.clone(),
+        tags:            current_doc.tags.clone(),
+        metadata:        current_doc.metadata.clone(),
+        size:            current_doc.size,
+        chunks:          current_doc.chunks.clone(),
+        deleted:         false,
+        doc_signature:   current_doc.doc_signature.clone(),
+        public_key_hint: current_doc.public_key_hint.clone(),
+        encrypted:       current_doc.encrypted,
+        encryption_meta: current_doc.encryption_meta.clone(),
+    };
+
+    let block = state
+        .node
+        .commit_documents(
+            vec![transferred_doc],
+            vec![],
+            caller.id.clone(),
+            caller.id.clone(),
+        )
+        .map_err(|e| {
+            (
+                StatusCode::FORBIDDEN,
+                axum::Json(json!({"error": e})),
+            )
+                .into_response()
+        })?;
+
+    // P2P-Broadcast
+    if let Some(ref network) = state.network {
+        let block_clone  = block.clone();
+        let network_clone = network.clone();
+        let chain_count  = state.node.chain.lock().unwrap().blocks.len() as u64;
+        tokio::spawn(async move {
+            network_clone.broadcast_block(block_clone).await;
+            network_clone.set_chain_count(chain_count).await;
+        });
+    }
+
+    state.node.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+
+    Ok((
+        StatusCode::OK,
+        axum::Json(json!({
+            "transferred": true,
+            "doc_id":      doc_id,
+            "from_user":   caller.id,
+            "to_user":     to_id,
+            "version":     block.index,
+            "block_index": block.index,
+            "block_hash":  block.hash,
         })),
     ))
 }
@@ -2339,6 +2493,7 @@ fn build_router(state: AppState) -> Router {
             "/api/v1/documents/:doc_id/history",
             get(handle_document_history),
         )
+        .route("/api/v1/documents/:doc_id/transfer", post(handle_transfer_document))
         .route("/api/v1/documents/:doc_id/data", get(handle_get_document_data))
         .route("/api/v1/documents/:doc_id/download", get(handle_get_document_data))
         // Chunk-API für Peer-Sync
