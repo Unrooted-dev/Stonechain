@@ -1,0 +1,733 @@
+{% extends "base.html" %}
+
+{% block title %}StoneChain — Unrooted{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/blockchain.css') }}" />
+{% endblock %}
+
+{% block content %}
+<section class="bc-page">
+
+  <!-- ── Auth Modal (Login / Registrieren) ──────────────────────────────────── -->
+  <div class="bc-modal" id="authModal" style="display:none">
+    <div class="bc-modal__box bc-modal__box--auth">
+      <div class="bc-modal__header">
+        <span id="authModalTitle">Anmelden</span>
+      </div>
+      <div class="bc-modal__body" id="authModalBody">
+
+        <!-- Tab-Leiste -->
+        <div class="bc-auth-tabs">
+          <button class="bc-auth-tab bc-auth-tab--active" id="tabLogin" onclick="switchAuthTab('login')">
+            <i class="fas fa-right-to-bracket"></i> Anmelden
+          </button>
+          <button class="bc-auth-tab" id="tabSignup" onclick="switchAuthTab('signup')">
+            <i class="fas fa-user-plus"></i> Registrieren
+          </button>
+        </div>
+
+        <!-- Login-Formular -->
+        <div id="loginPanel">
+          <p class="bc-auth-hint">
+            Gib deine 12-Wörter-Wiederherstellungs-Phrase ein, um dich anzumelden.
+          </p>
+          <div class="bc-form-row">
+            <label>Wiederherstellungs-Phrase</label>
+            <textarea id="loginPhrase" rows="3"
+              placeholder="wort1 wort2 wort3 wort4 wort5 wort6 wort7 wort8 wort9 wort10 wort11 wort12"
+              class="bc-phrase-input"></textarea>
+          </div>
+          <div class="bc-form-row bc-form-row--actions">
+            <button class="bc-btn" onclick="doLogin()">
+              <i class="fas fa-right-to-bracket"></i> Anmelden
+            </button>
+            <span id="loginStatus" class="bc-auth-status"></span>
+          </div>
+        </div>
+
+        <!-- Registrierungsformular -->
+        <div id="signupPanel" style="display:none">
+          <p class="bc-auth-hint">
+            Erstelle ein neues Konto. Du erhältst eine einmalige 12-Wörter-Phrase —
+            <strong>bewahre sie sicher auf</strong>, sie ist dein einziges Passwort.
+          </p>
+          <div class="bc-form-row">
+            <label>Name <span class="bc-required">*</span></label>
+            <input type="text" id="signupName" placeholder="Dein Name" maxlength="80" />
+          </div>
+          <div class="bc-form-row bc-form-row--actions">
+            <button class="bc-btn" onclick="doSignup()">
+              <i class="fas fa-user-plus"></i> Konto erstellen
+            </button>
+            <span id="signupStatus" class="bc-auth-status"></span>
+          </div>
+        </div>
+
+        <!-- Phrase-Anzeige nach Registrierung (einmalig) -->
+        <div id="phraseDisplay" style="display:none">
+          <p class="bc-auth-hint bc-auth-hint--warn">
+            <i class="fas fa-triangle-exclamation"></i>
+            Notiere diese Phrase jetzt — sie wird <strong>nur einmal</strong> angezeigt!
+          </p>
+          <div class="bc-phrase-box" id="phraseBox"></div>
+          <div class="bc-form-row bc-form-row--actions">
+            <button class="bc-btn" onclick="copyPhrase()">
+              <i class="fas fa-copy"></i> Kopieren
+            </button>
+            <button class="bc-btn bc-btn--primary" onclick="confirmPhraseAndLogin()">
+              <i class="fas fa-check"></i> Ich habe sie gespeichert
+            </button>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+  <div class="bc-modal-backdrop" id="authModalBackdrop" style="display:none"
+       onclick="if(!requireLogin)this.style.display='none',document.getElementById('authModal').style.display='none'"></div>
+
+  <!-- ── Header ──────────────────────────────────────────────────────────── -->
+  <div class="bc-header" data-reveal data-reveal-type="fade-up">
+    <div class="bc-header__left">
+      <h1 class="bc-header__title">
+        <i class="fas fa-cubes"></i> StoneChain
+      </h1>
+      <p class="bc-header__sub">
+        Dezentrale Dokumenten-Blockchain — unveränderlich, transparent, vertrauenswürdig.
+      </p>
+    </div>
+    <div class="bc-header__right">
+      <!-- Nutzer-Info (sichtbar wenn angemeldet) -->
+      <div id="userInfo" style="display:none" class="bc-user-pill">
+        <i class="fas fa-user-circle"></i>
+        <span id="userNameDisplay"></span>
+        <button class="bc-btn bc-btn--xs bc-btn--ghost" onclick="doLogout()" title="Abmelden">
+          <i class="fas fa-right-from-bracket"></i>
+        </button>
+      </div>
+      <!-- Anmelden-Button (sichtbar wenn nicht angemeldet) -->
+      <button id="loginBtn" class="bc-btn bc-btn--sm" onclick="openAuthModal()">
+        <i class="fas fa-right-to-bracket"></i> Anmelden
+      </button>
+      <span class="bc-status-badge" id="statusBadge">
+        <span class="bc-status-badge__dot"></span>
+        <span id="statusText">Verbinde…</span>
+      </span>
+    </div>
+  </div>
+
+  <!-- ── Stats Strip ─────────────────────────────────────────────────────── -->
+  <div class="bc-stats-strip" id="statsStrip" data-reveal data-reveal-type="fade-up">
+    <div class="bc-stat">
+      <span class="bc-stat__val" id="statBlocks">–</span>
+      <span class="bc-stat__label">Blocks</span>
+    </div>
+    <div class="bc-stat">
+      <span class="bc-stat__val" id="statDocs">–</span>
+      <span class="bc-stat__label">Dokumente</span>
+    </div>
+    <div class="bc-stat">
+      <span class="bc-stat__val" id="statValid">–</span>
+      <span class="bc-stat__label">Chain-Status</span>
+    </div>
+    <div class="bc-stat">
+      <span class="bc-stat__val" id="statPeers">–</span>
+      <span class="bc-stat__label">Peers</span>
+    </div>
+  </div>
+
+  <!-- ── Suche + Dokumente ───────────────────────────────────────────────── -->
+  <div class="bc-card" data-reveal data-reveal-type="fade-up">
+    <div class="bc-card__header">
+      <i class="fas fa-file-contract"></i> Meine Dokumente
+      <div class="bc-card__header-actions">
+        <input class="bc-search-input" id="pubSearch" type="text"
+               placeholder="Suche: Titel, Tag…"
+               oninput="liveSearch(this.value)" />
+        <select class="bc-search-input bc-search-input--sm" id="pubSearchType"
+                onchange="liveSearch(document.getElementById('pubSearch').value)">
+          <option value="">Alle Typen</option>
+          <option value="pdf">PDF</option>
+          <option value="image">Bild</option>
+          <option value="text">Text</option>
+        </select>
+      </div>
+    </div>
+    <div class="bc-card__body">
+      <div id="docsBody"><p class="bc-placeholder">Bitte zuerst anmelden.</p></div>
+    </div>
+  </div>
+
+  <!-- ── Dokument hochladen ───────────────────────────────────────────────── -->
+  <div class="bc-card" id="uploadCard" data-reveal data-reveal-type="fade-up" style="display:none">
+    <div class="bc-card__header">
+      <i class="fas fa-upload"></i> Dokument einreichen
+    </div>
+    <div class="bc-card__body">
+      <p class="bc-upload-hint">
+        Eingereichte Dokumente werden kryptographisch in die Chain aufgenommen
+        und sind danach unveränderlich nachweisbar.
+      </p>
+      <!-- Unterstützte Formate + Max-Größe -->
+      <div class="bc-upload-info">
+        <div class="bc-upload-info__formats">
+          <span class="bc-upload-info__label"><i class="fas fa-circle-check"></i> Unterstützte Formate:</span>
+          <span class="bc-upload-info__badge">PDF</span>
+          <span class="bc-upload-info__badge">TXT</span>
+          <span class="bc-upload-info__badge">MD</span>
+          <span class="bc-upload-info__badge">JSON</span>
+          <span class="bc-upload-info__badge">CSV</span>
+          <span class="bc-upload-info__badge">XML</span>
+          <span class="bc-upload-info__badge">PNG</span>
+          <span class="bc-upload-info__badge">JPG</span>
+          <span class="bc-upload-info__badge">GIF</span>
+          <span class="bc-upload-info__badge">WEBP</span>
+          <span class="bc-upload-info__badge">ZIP</span>
+          <span class="bc-upload-info__badge">DOCX</span>
+          <span class="bc-upload-info__badge">XLSX</span>
+        </div>
+        <div class="bc-upload-info__limit">
+          <i class="fas fa-weight-hanging"></i> Max. Dateigröße: <strong>5 GiB</strong>
+        </div>
+      </div>
+      <form id="uploadForm" class="bc-upload-form">
+        <div class="bc-form-row">
+          <label>Datei <span class="bc-required">*</span></label>
+          <input type="file" id="uploadFile"
+            accept=".pdf,.txt,.md,.json,.csv,.xml,.png,.jpg,.jpeg,.gif,.webp,.zip,.docx,.xlsx,
+                    application/pdf,text/plain,text/markdown,application/json,text/csv,text/xml,
+                    application/xml,image/png,image/jpeg,image/gif,image/webp,
+                    application/zip,application/x-zip-compressed,
+                    application/vnd.openxmlformats-officedocument.wordprocessingml.document,
+                    application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            required />
+          <div id="fileInfo" class="bc-file-info" style="display:none">
+            <span id="fileName"></span>
+            <span id="fileSize" class="bc-file-info__size"></span>
+            <span id="fileSizeWarn" class="bc-file-info__warn" style="display:none">
+              <i class="fas fa-triangle-exclamation"></i> Datei zu groß (max. 5 GiB)
+            </span>
+            <span id="fileTypeWarn" class="bc-file-info__warn" style="display:none">
+              <i class="fas fa-triangle-exclamation"></i> Dateityp nicht unterstützt
+            </span>
+          </div>
+        </div>
+        <div class="bc-form-row">
+          <label>Titel</label>
+          <input type="text" id="uploadTitle" placeholder="Dokument-Titel" />
+        </div>
+        <div class="bc-form-row">
+          <label>Tags</label>
+          <input type="text" id="uploadTags" placeholder="legal, v1, öffentlich" />
+        </div>
+        <div class="bc-form-row bc-form-row--actions">
+          <button type="submit" class="bc-btn" id="uploadSubmit">
+            <i class="fas fa-cloud-upload-alt"></i> In Chain einreichen
+          </button>
+          <span id="uploadStatus"></span>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ── Dokument-Detail-Modal ────────────────────────────────────────────── -->
+  <div class="bc-modal" id="docModal" style="display:none">
+    <div class="bc-modal__box">
+      <div class="bc-modal__header">
+        <span id="modalTitle">Dokument</span>
+        <button class="bc-modal__close" id="modalClose">✕</button>
+      </div>
+      <div class="bc-modal__body" id="modalBody"></div>
+      <div class="bc-modal__footer">
+        <a class="bc-btn" id="modalDownload" href="#" target="_blank">
+          <i class="fas fa-download"></i> Herunterladen
+        </a>
+        <button class="bc-btn bc-btn--sm" id="modalHistory">
+          <i class="fas fa-clock-rotate-left"></i> Versionen
+        </button>
+      </div>
+    </div>
+  </div>
+  <div class="bc-modal-backdrop" id="modalBackdrop" style="display:none"></div>
+
+</section>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function () {
+  "use strict";
+
+  // ── API-Endpunkte ──────────────────────────────────────────────────────────
+  // Proxy-Routen der Flask-Blueprint "stonechain"
+  const API_DOCS    = "{{ url_for('stonechain.pub_api_documents') }}";
+  const API_SEARCH  = "{{ url_for('stonechain.pub_api_search') }}";
+  const API_BASE    = API_DOCS.replace("/api/documents", "");
+  const PUB_STATUS  = "{{ url_for('blockchain.mgmt_api_status') }}";
+
+  // Auth-Endpunkte (direkt zum Stone-Knoten, über Flask-Proxy)
+  // TODO: Folgende zwei Routen in der Flask-App (stonechain-Blueprint) anlegen:
+  //   POST /stonechain/api/auth/signup  → proxy to stone /api/v1/auth/signup
+  //   POST /stonechain/api/auth/login   → proxy to stone /api/v1/auth/login
+  // Beide ohne Server-API-Key, da sie öffentlich sind.
+  const API_SIGNUP  = API_BASE + "/api/auth/signup";
+  const API_LOGIN   = API_BASE + "/api/auth/login";
+  // User-Dokumente-Endpunkt:
+  // TODO: Flask-Route anlegen:
+  //   GET /stonechain/api/users/<user_id>/documents → proxy mit x-api-key aus Request-Header
+  const API_USER_DOCS = (userId) => `${API_BASE}/api/users/${userId}/documents`;
+
+  // ── Session-State ──────────────────────────────────────────────────────────
+  const SESSION_KEY = "sc_session";
+
+  function getSession() {
+    try { return JSON.parse(sessionStorage.getItem(SESSION_KEY) || "null"); }
+    catch { return null; }
+  }
+
+  function setSession(data) {
+    sessionStorage.setItem(SESSION_KEY, JSON.stringify(data));
+  }
+
+  function clearSession() {
+    sessionStorage.removeItem(SESSION_KEY);
+  }
+
+  // ── Auth-Modal ─────────────────────────────────────────────────────────────
+  let _pendingPhrase = null;
+  let _pendingUser   = null;
+
+  window.switchAuthTab = function(tab) {
+    const isLogin = tab === "login";
+    document.getElementById("loginPanel").style.display  = isLogin ? "" : "none";
+    document.getElementById("signupPanel").style.display = isLogin ? "none" : "";
+    document.getElementById("phraseDisplay").style.display = "none";
+    document.getElementById("tabLogin").classList.toggle("bc-auth-tab--active", isLogin);
+    document.getElementById("tabSignup").classList.toggle("bc-auth-tab--active", !isLogin);
+    document.getElementById("authModalTitle").textContent = isLogin ? "Anmelden" : "Registrieren";
+  };
+
+  window.openAuthModal = function() {
+    switchAuthTab("login");
+    document.getElementById("authModal").style.display = "";
+    document.getElementById("authModalBackdrop").style.display = "";
+  };
+
+  function closeAuthModal() {
+    document.getElementById("authModal").style.display = "none";
+    document.getElementById("authModalBackdrop").style.display = "none";
+  }
+
+  window.doLogin = async function() {
+    const phrase = document.getElementById("loginPhrase").value.trim();
+    const stat   = document.getElementById("loginStatus");
+    if (!phrase) { stat.textContent = "Bitte Phrase eingeben."; stat.style.color = "#f87171"; return; }
+    stat.textContent = "Prüfe…"; stat.style.color = "#facc15";
+    try {
+      const r = await fetch(API_LOGIN, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ phrase }),
+      });
+      const d = await r.json();
+      if (!r.ok) {
+        stat.textContent = "✗ " + (d.error ?? `HTTP ${r.status}`);
+        stat.style.color = "#f87171";
+        return;
+      }
+      setSession({ id: d.id, name: d.name, api_key: d.api_key });
+      stat.textContent = ""; 
+      closeAuthModal();
+      onLoginSuccess();
+    } catch(e) {
+      stat.textContent = "✗ " + e.message; stat.style.color = "#f87171";
+    }
+  };
+
+  window.doSignup = async function() {
+    const name = document.getElementById("signupName").value.trim();
+    const stat = document.getElementById("signupStatus");
+    if (!name) { stat.textContent = "Name darf nicht leer sein."; stat.style.color = "#f87171"; return; }
+    stat.textContent = "Erstelle Konto…"; stat.style.color = "#facc15";
+    try {
+      const r = await fetch(API_SIGNUP, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+      const d = await r.json();
+      if (!r.ok) {
+        stat.textContent = "✗ " + (d.error ?? `HTTP ${r.status}`);
+        stat.style.color = "#f87171";
+        return;
+      }
+      _pendingPhrase = d.phrase;
+      _pendingUser   = { id: d.id, name: d.name, api_key: d.api_key };
+      stat.textContent = "";
+      // Phrase anzeigen
+      document.getElementById("loginPanel").style.display  = "none";
+      document.getElementById("signupPanel").style.display = "none";
+      document.getElementById("phraseDisplay").style.display = "";
+      document.getElementById("phraseBox").textContent = d.phrase;
+      document.getElementById("authModalTitle").textContent = "Phrase sichern";
+    } catch(e) {
+      stat.textContent = "✗ " + e.message; stat.style.color = "#f87171";
+    }
+  };
+
+  window.copyPhrase = function() {
+    if (_pendingPhrase) {
+      navigator.clipboard.writeText(_pendingPhrase).then(() => {
+        const btn = event.currentTarget;
+        btn.innerHTML = '<i class="fas fa-check"></i> Kopiert!';
+        setTimeout(() => btn.innerHTML = '<i class="fas fa-copy"></i> Kopieren', 2000);
+      });
+    }
+  };
+
+  window.confirmPhraseAndLogin = function() {
+    if (!_pendingUser) return;
+    setSession(_pendingUser);
+    _pendingPhrase = null;
+    _pendingUser   = null;
+    closeAuthModal();
+    onLoginSuccess();
+  };
+
+  window.doLogout = function() {
+    clearSession();
+    onLogout();
+  };
+
+  // ── Login / Logout Hooks ──────────────────────────────────────────────────
+  function onLoginSuccess() {
+    const sess = getSession();
+    if (!sess) return;
+    document.getElementById("userNameDisplay").textContent = sess.name;
+    document.getElementById("userInfo").style.display = "";
+    document.getElementById("loginBtn").style.display = "none";
+    document.getElementById("uploadCard").style.display = "";
+    fetchDocs();
+  }
+
+  function onLogout() {
+    document.getElementById("userInfo").style.display  = "none";
+    document.getElementById("loginBtn").style.display  = "";
+    document.getElementById("uploadCard").style.display = "none";
+    document.getElementById("docsBody").innerHTML =
+      '<p class="bc-placeholder">Bitte zuerst anmelden.</p>';
+    allDocs = [];
+  }
+
+  // ── Stats Strip ────────────────────────────────────────────────────────────
+  async function fetchStats() {
+    try {
+      const r = await fetch(PUB_STATUS);
+      if (!r.ok) throw new Error();
+      const d = await r.json();
+      const c = d.chain || {};
+      document.getElementById("statBlocks").textContent = c.block_height ?? "–";
+      document.getElementById("statDocs").textContent   = c.total_documents ?? "–";
+      document.getElementById("statValid").textContent  = c.is_valid ? "✓ Gültig" : "✗ Fehler";
+      document.getElementById("statValid").style.color  = c.is_valid ? "#4ade80" : "#f87171";
+      document.getElementById("statPeers").textContent  = (d.peers ?? []).length;
+
+      const badge = document.getElementById("statusBadge");
+      document.getElementById("statusText").textContent = "Online";
+      badge.classList.add("bc-status-badge--online");
+      badge.classList.remove("bc-status-badge--offline");
+    } catch {
+      document.getElementById("statusText").textContent = "Offline";
+      document.getElementById("statusBadge").classList.add("bc-status-badge--offline");
+    }
+  }
+
+  // ── Dokumente ──────────────────────────────────────────────────────────────
+  let allDocs = [];
+
+  function renderDocs(list) {
+    const el = document.getElementById("docsBody");
+    if (!list.length) {
+      el.innerHTML = '<p class="bc-placeholder">Keine Dokumente vorhanden.</p>';
+      return;
+    }
+    const cards = list.map(doc => {
+      const hash  = doc.doc_id ?? "";
+      const name  = doc.title ?? doc.filename ?? "Unbenannt";
+      const owner = doc.owner ?? "–";
+      const tags  = (doc.tags ?? []).map(t =>
+        `<span class="bc-tag">${t}</span>`).join("") || "";
+      const ts    = doc.updated_at;
+      const tsStr = ts ? new Date(ts * 1000).toLocaleString("de-DE") : "–";
+      const type  = doc.content_type ?? "";
+      const icon  = type.includes("pdf")   ? "fa-file-pdf"
+                  : type.includes("image") ? "fa-file-image"
+                  : type.includes("zip")   ? "fa-file-zipper"
+                  : type.includes("word") || type.includes("docx") ? "fa-file-word"
+                  : type.includes("sheet") || type.includes("xlsx") ? "fa-file-excel"
+                  : "fa-file-lines";
+      if (!hash) return "";
+      return `
+        <div class="bc-doc-card" onclick="openDoc('${hash}','${name}')">
+          <div class="bc-doc-card__icon"><i class="fas ${icon}"></i></div>
+          <div class="bc-doc-card__body">
+            <div class="bc-doc-card__name">${name}</div>
+            <div class="bc-doc-card__meta">
+              <span><i class="fas fa-user"></i> ${owner}</span>
+              <span><i class="fas fa-clock"></i> ${tsStr}</span>
+            </div>
+            <div class="bc-doc-card__tags">${tags}</div>
+          </div>
+          <div class="bc-doc-card__hash bc-table__mono">${hash.slice(0, 12)}…</div>
+        </div>`;
+    }).join("");
+    el.innerHTML = `<div class="bc-doc-grid">${cards}</div>`;
+  }
+
+  async function fetchDocs() {
+    const sess = getSession();
+    if (!sess) {
+      document.getElementById("docsBody").innerHTML =
+        '<p class="bc-placeholder">Bitte zuerst anmelden.</p>';
+      return;
+    }
+    try {
+      const r = await fetch(API_USER_DOCS(sess.id), {
+        headers: { "x-api-key": sess.api_key },
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      allDocs = Array.isArray(data) ? data : (data.documents ?? data.data ?? []);
+      renderDocs(allDocs);
+    } catch(e) {
+      document.getElementById("docsBody").innerHTML =
+        `<p class="bc-placeholder bc-placeholder--err"><i class="fas fa-triangle-exclamation"></i> ${e.message}</p>`;
+    }
+  }
+
+  // ── Live-Suche ─────────────────────────────────────────────────────────────
+  window.liveSearch = function(q) {
+    const type = document.getElementById("pubSearchType").value.toLowerCase();
+    q = q.toLowerCase();
+    const filtered = allDocs.filter(d => {
+      const matchQ = !q
+        || (d.title ?? d.filename ?? "").toLowerCase().includes(q)
+        || (d.owner ?? "").toLowerCase().includes(q)
+        || (d.tags ?? []).some(t => t.toLowerCase().includes(q));
+      const matchType = !type
+        || (d.content_type ?? "").toLowerCase().includes(type);
+      return matchQ && matchType;
+    });
+    renderDocs(filtered);
+  };
+
+  // ── Dokument-Detail Modal ──────────────────────────────────────────────────
+  window.openDoc = async function(hash, name) {
+    if (!hash) return;
+    const sess = getSession();
+    const authHeaders = sess ? { "x-api-key": sess.api_key } : {};
+    document.getElementById("modalTitle").textContent = name;
+    document.getElementById("modalBody").innerHTML = '<p class="bc-placeholder">Lade…</p>';
+    document.getElementById("modalDownload").href = `${API_BASE}/api/documents/${hash}/download`;
+    document.getElementById("docModal").style.display = "";
+    document.getElementById("modalBackdrop").style.display = "";
+    document.getElementById("modalHistory").onclick = () => loadHistory(hash);
+
+    try {
+      const r = await fetch(`${API_BASE}/api/documents/${hash}`, { headers: authHeaders });
+      const data = await r.json();
+      const doc  = data.document ?? data;
+      const rows = Object.entries(doc)
+        .map(([k, v]) => `<tr><th>${k}</th><td>${typeof v === "object" ? JSON.stringify(v) : v}</td></tr>`)
+        .join("");
+      document.getElementById("modalBody").innerHTML =
+        `<table class="bc-table"><tbody>${rows}</tbody></table>`;
+    } catch(e) {
+      document.getElementById("modalBody").innerHTML =
+        `<p class="bc-placeholder bc-placeholder--err">${e.message}</p>`;
+    }
+  };
+
+  function closeModal() {
+    document.getElementById("docModal").style.display = "none";
+    document.getElementById("modalBackdrop").style.display = "none";
+  }
+  document.getElementById("modalClose").addEventListener("click", closeModal);
+  document.getElementById("modalBackdrop").addEventListener("click", closeModal);
+
+  async function loadHistory(hash) {
+    if (!hash) return;
+    const sess = getSession();
+    const authHeaders = sess ? { "x-api-key": sess.api_key } : {};
+    document.getElementById("modalBody").innerHTML = '<p class="bc-placeholder">Lade Historie…</p>';
+    try {
+      const r = await fetch(`${API_BASE}/api/documents/${hash}/history`, { headers: authHeaders });
+      const data = await r.json();
+      const list = Array.isArray(data) ? data : (data.history ?? []);
+      if (!list.length) {
+        document.getElementById("modalBody").innerHTML = '<p class="bc-placeholder">Keine Versionen.</p>';
+        return;
+      }
+      const rows = list.map(v => `<tr>
+        <td>${v.version ?? "–"}</td>
+        <td class="bc-table__mono">${(v.doc_id ?? v.hash ?? "–").slice(0, 14)}…</td>
+        <td>${v.updated_at ? new Date(v.updated_at * 1000).toLocaleString("de-DE") : "–"}</td>
+      </tr>`).join("");
+      document.getElementById("modalBody").innerHTML =
+        `<table class="bc-table"><thead><tr><th>Version</th><th>Hash</th><th>Datum</th></tr></thead><tbody>${rows}</tbody></table>`;
+    } catch(e) {
+      document.getElementById("modalBody").innerHTML =
+        `<p class="bc-placeholder bc-placeholder--err">${e.message}</p>`;
+    }
+  }
+
+  // ── Upload-Datei Validierung ───────────────────────────────────────────────
+  const MAX_BYTES = 5 * 1024 * 1024 * 1024;
+
+  const ALLOWED_MIME = new Set([
+    "application/pdf",
+    "text/plain", "text/markdown", "text/csv", "text/xml",
+    "application/json", "application/xml",
+    "image/png", "image/jpeg", "image/gif", "image/webp",
+    "application/zip", "application/x-zip-compressed",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ]);
+
+  const ALLOWED_EXT = new Set([
+    "pdf","txt","md","json","csv","xml",
+    "png","jpg","jpeg","gif","webp",
+    "zip","docx","xlsx",
+  ]);
+
+  function fmtBytes(b) {
+    if (b >= 1024 ** 3) return (b / 1024 ** 3).toFixed(2) + " GiB";
+    if (b >= 1024 ** 2) return (b / 1024 ** 2).toFixed(1) + " MiB";
+    if (b >= 1024)      return (b / 1024).toFixed(1) + " KiB";
+    return b + " B";
+  }
+
+  function validateFile(file) {
+    const ext  = (file.name.split(".").pop() ?? "").toLowerCase();
+    const mime = file.type || "";
+    return {
+      sizeOk: file.size <= MAX_BYTES,
+      typeOk: ALLOWED_MIME.has(mime) || ALLOWED_EXT.has(ext),
+    };
+  }
+
+  document.getElementById("uploadFile").addEventListener("change", function () {
+    const file = this.files[0];
+    const info     = document.getElementById("fileInfo");
+    const nameEl   = document.getElementById("fileName");
+    const sizeEl   = document.getElementById("fileSize");
+    const sizeWarn = document.getElementById("fileSizeWarn");
+    const typeWarn = document.getElementById("fileTypeWarn");
+    const submit   = document.getElementById("uploadSubmit");
+
+    if (!file) { info.style.display = "none"; submit.disabled = false; return; }
+
+    const { sizeOk, typeOk } = validateFile(file);
+    const pct = Math.min(100, (file.size / MAX_BYTES) * 100);
+
+    nameEl.textContent     = file.name;
+    sizeEl.textContent     = fmtBytes(file.size);
+    sizeEl.style.color     = sizeOk ? "#4ade80" : "#f87171";
+    sizeWarn.style.display = sizeOk ? "none" : "";
+    typeWarn.style.display = typeOk ? "none" : "";
+    info.style.display     = "";
+
+    let bar = document.getElementById("fileSizeBar");
+    if (!bar) {
+      bar = document.createElement("div");
+      bar.id = "fileSizeBar";
+      bar.className = "bc-size-bar";
+      bar.innerHTML = '<div class="bc-size-bar__fill"></div>';
+      info.appendChild(bar);
+    }
+    const fill = bar.querySelector(".bc-size-bar__fill");
+    fill.style.width      = pct + "%";
+    fill.style.background = sizeOk ? (pct > 80 ? "#facc15" : "#4ade80") : "#f87171";
+
+    submit.disabled = !sizeOk || !typeOk;
+    submit.title    = !typeOk ? "Dateityp nicht unterstützt"
+                    : !sizeOk ? "Datei überschreitet 5 GiB Limit"
+                    : "";
+  });
+
+  // ── Upload ─────────────────────────────────────────────────────────────────
+  document.getElementById("uploadForm").addEventListener("submit", async function(e) {
+    e.preventDefault();
+    const sess  = getSession();
+    if (!sess) { openAuthModal(); return; }
+
+    const file  = document.getElementById("uploadFile").files[0];
+    const title = document.getElementById("uploadTitle").value.trim();
+    const tags  = document.getElementById("uploadTags").value.trim();
+    const stat  = document.getElementById("uploadStatus");
+    if (!file) return;
+
+    const { sizeOk, typeOk } = validateFile(file);
+    if (!typeOk) {
+      stat.textContent = "✗ Dateityp nicht unterstützt";
+      stat.style.color = "#f87171";
+      return;
+    }
+    if (!sizeOk) {
+      stat.textContent = `✗ Datei zu groß (${fmtBytes(file.size)} / max. 5 GiB)`;
+      stat.style.color = "#f87171";
+      return;
+    }
+
+    stat.textContent = "Lädt hoch…";
+    stat.style.color = "#facc15";
+
+    const fd = new FormData();
+    fd.append("file", file);
+    if (title) fd.append("title", title);
+    if (tags)  fd.append("tags",  tags);
+
+    try {
+      const r = await fetch(API_DOCS, {
+        method: "POST",
+        headers: { "x-api-key": sess.api_key },
+        body: fd,
+      });
+      const data = await r.json();
+      if (r.ok) {
+        stat.textContent = "✓ In Chain eingetragen";
+        stat.style.color = "#4ade80";
+        this.reset();
+        fetchDocs();
+        fetchStats();
+      } else {
+        stat.textContent = "✗ " + (data.error ?? `HTTP ${r.status}`);
+        stat.style.color = "#f87171";
+      }
+    } catch(e) {
+      stat.textContent = "✗ " + e.message;
+      stat.style.color = "#f87171";
+    }
+  });
+
+  // ── Init ───────────────────────────────────────────────────────────────────
+  document.addEventListener("DOMContentLoaded", () => {
+    fetchStats();
+    setInterval(fetchStats, 30_000);
+
+    // Session prüfen
+    const sess = getSession();
+    if (sess) {
+      onLoginSuccess();
+    }
+    // Anmelden-Button Handler (Enter in Phrase-Feld)
+    document.getElementById("loginPhrase").addEventListener("keydown", function(e) {
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); doLogin(); }
+    });
+  });
+
+}());
+</script>
+{% endblock %}
+

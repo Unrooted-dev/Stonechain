@@ -1,0 +1,27 @@
+[Unit]
+Description=Stone Master Node (Blockchain)
+After=network.target
+# Startet nach forge-Nomad nicht nötig — unabhängiger Dienst
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/stone
+
+# .env wird über EnvironmentFile geladen → STONE_CLUSTER_API_KEY bleibt fix
+EnvironmentFile=/opt/stone/.env
+
+ExecStart=/opt/stone/target/release/server
+Restart=on-failure
+RestartSec=5s
+
+# Logs
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=stone-master
+
+# Sicherheit: Node läuft nur lokal, kein externer Port nötig
+# STONE_PORT=8080 ist in .env gesetzt
+
+[Install]
+WantedBy=multi-user.target

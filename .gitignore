@@ -1,0 +1,44 @@
+# ─── Build-Artefakte ─────────────────────────────────────────────────────────
+/target/
+
+# ─── Secrets & API-Keys (NIE committen) ──────────────────────────────────────
+.env
+*.env.local
+token.bin
+stone_data/token.bin
+
+# ─── Laufzeit-Daten (generiert vom Node, nicht versioniert) ──────────────────
+stone_data/chain_db/
+stone_data/chunks/
+stone_data/keys/
+stone_data/p2p.key
+stone_data/p2p_config.json
+stone_data/validators.json
+stone_data/users.json
+stone_data/chain.bin
+
+# ─── TLS-Zertifikate & PKI ───────────────────────────────────────────────────
+# Produzierte Certs gehören nicht ins Repo — nur Root-CA für dev kann committed werden
+tls/
+*.crt
+*.key
+*.pem
+*.srl
+ca/
+
+# ─── macOS System-Dateien ─────────────────────────────────────────────────────
+.DS_Store
+**/.DS_Store
+
+# ─── Editoren & IDEs ──────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ─── Backups & temporäre Dateien ─────────────────────────────────────────────
+*.bak
+*.tmp
+*.orig
+flycheck*/
+

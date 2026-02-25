@@ -1,0 +1,22 @@
+[Unit]
+Description=forge-Nomad (Flask Web App)
+After=network.target stone-master.service
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/forge-nomad
+
+# .env mit BLOCKCHAIN_URL=http://localhost:8080 und BLOCKCHAIN_API_KEY
+EnvironmentFile=/opt/forge-nomad/.env
+
+ExecStart=/opt/forge-nomad/.venv/bin/gunicorn wsgi:app -c gunicorn.conf.py
+Restart=on-failure
+RestartSec=5s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=forge-nomad
+
+[Install]
+WantedBy=multi-user.target

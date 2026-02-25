@@ -1,0 +1,83 @@
+# Cargo.toml – Stone Master Node
+[package]
+name = "stone"
+version = "0.2.0"
+edition = "2021"
+
+# ─── Binaries ────────────────────────────────────────────────────────────────
+
+[[bin]]
+name = "stone-master"
+path = "src/bin/master_server.rs"
+
+[[bin]]
+name = "stone-auth"
+path = "src/bin/auth_server.rs"
+
+# ─── Abhängigkeiten ───────────────────────────────────────────────────────────
+[dependencies]
+# Serialisierung
+serde       = { version = "1.0",   features = ["derive"] }
+serde_json  = "1.0"
+bincode     = { version = "2.0.1", features = ["serde"] }
+
+# Persistenz
+rocksdb     = { version = "0.22", default-features = false, features = ["snappy"] }
+
+# Zeit & Hashing
+sha2    = "0.10"
+chrono  = { version = "0.4", features = ["serde"] }
+hmac    = "0.12"
+hex     = "0.4"
+rand    = "0.8"
+base64  = "0.21"
+
+# Async-Runtime
+tokio   = { version = "1", features = ["full"] }
+bytes   = "1.0"
+
+# TLS
+rustls          = "0.23"
+tokio-rustls    = "0.26"
+rustls-pemfile  = "2.1"
+
+# HTTP-Server (axum – Master Node API + Auth Server)
+axum        = { version = "0.7", features = ["macros", "json", "multipart", "ws"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+tower-http  = { version = "0.5", features = ["cors"] }
+
+# HTTP-Client (Peer-Sync)
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+
+# Auth / Krypto
+bip39           = { version = "1.2", default-features = false, features = ["std", "rand"] }
+x509-parser     = "0.16"
+rcgen           = "0.12"
+# Ed25519 Schlüsselpaar, Signierung und Verifikation
+ed25519-dalek   = { version = "2.1", features = ["rand_core"] }
+# X25519 Diffie-Hellman für ECDH-Schlüsselableitung (Verschlüsselung)
+x25519-dalek    = { version = "2.0", features = ["static_secrets"] }
+# AES-256-GCM für Dokument-Verschlüsselung
+aes-gcm         = "0.10"
+
+# ─── P2P-Netzwerk (libp2p) ───────────────────────────────────────────────────
+libp2p = { version = "0.54", features = [
+    "tcp",
+    "noise",
+    "yamux",
+    "mdns",
+    "kad",
+    "identify",
+    "gossipsub",
+    "request-response",
+    "cbor",
+    "tokio",
+    "macros",
+    "ed25519",
+] }
+
+# Hilfsmittel
+anyhow          = "1.0"
+futures-util    = { version = "0.3", default-features = false, features = ["std"] }
+hostname        = "0.3"
+url             = "2.5"

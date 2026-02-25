@@ -1,0 +1,1110 @@
+{% extends "management_base.html" %}
+
+{% block title %}Blockchain Node — Management{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/blockchain.css') }}" />
+{% endblock %}
+
+{% block content %}
+<section class="bc-page">
+
+  <!-- ── Header ──────────────────────────────────────────────────────────── -->
+  <div class="bc-header">
+    <h1 class="bc-header__title">
+      <i class="fas fa-cubes"></i> StoneChain — Node Control
+    </h1>
+    <p class="bc-header__sub">Administrativer Vollzugriff auf den Master-Node</p>
+    <span class="bc-status-badge" id="statusBadge">
+      <span class="bc-status-badge__dot"></span>
+      <span id="statusText">Verbinde…</span>
+    </span>
+  </div>
+
+  <!-- ── Status + Peers Grid ─────────────────────────────────────────────── -->
+  <div class="bc-grid">
+
+    <div class="bc-card" id="statusCard">
+      <div class="bc-card__header">
+        <i class="fas fa-server"></i> Node Status
+        <button class="bc-btn bc-btn--sm" id="refreshStatus" style="margin-left:auto">
+          <i class="fas fa-rotate"></i>
+        </button>
+      </div>
+      <div class="bc-card__body" id="statusBody">
+        <p class="bc-placeholder">Lade…</p>
+      </div>
+    </div>
+
+    <div class="bc-card">
+      <div class="bc-card__header">
+        <i class="fas fa-network-wired"></i> Chain-Metriken
+      </div>
+      <div class="bc-card__body" id="metricsBody">
+        <p class="bc-placeholder">Lade…</p>
+      </div>
+    </div>
+
+  </div><!-- /.bc-grid -->
+
+  <!-- ── PoA / Consensus Panel ───────────────────────────────────────────── -->
+  <div class="bc-card" id="poaCard">
+    <div class="bc-card__header">
+      <i class="fas fa-shield-halved"></i> Proof-of-Authority — Konsensus
+      <div class="bc-card__header-actions">
+        <span class="bc-badge" id="poaBadge" style="margin-right:.5rem">PoA inaktiv</span>
+        <button class="bc-btn bc-btn--sm" id="refreshPoa">
+          <i class="fas fa-rotate"></i> Aktualisieren
+        </button>
+      </div>
+    </div>
+    <div class="bc-card__body">
+
+      <!-- Eigener Public Key dieser Node -->
+      <div class="bc-poa-section">
+        <div class="bc-poa-section__title">
+          <i class="fas fa-key"></i> Public Key dieser Node
+        </div>
+        <div class="bc-poa-key-row">
+          <code id="selfPubKey" class="bc-poa-key">Lade…</code>
+          <button class="bc-btn bc-btn--xs" id="copyPubKey" title="Kopieren">
+            <i class="fas fa-copy"></i>
+          </button>
+        </div>
+        <p class="bc-poa-hint">Diesen Key verwenden um diese Node als Validator zu registrieren.</p>
+      </div>
+
+      <!-- Validator-Liste + Hinzufügen -->
+      <div class="bc-poa-section">
+        <div class="bc-poa-section__title">
+          <i class="fas fa-list-check"></i> Validator-Whitelist
+          <button class="bc-btn bc-btn--xs" id="addValidatorBtn" style="margin-left:auto">
+            <i class="fas fa-plus"></i> Hinzufügen
+          </button>
+        </div>
+        <!-- Formular (initial versteckt) -->
+        <div id="addValidatorForm" style="display:none" class="bc-poa-add-form">
+          <div class="bc-form-row bc-form-row--compact">
+            <label>Node-ID</label>
+            <input type="text" id="vNodeId" placeholder="node-1" />
+          </div>
+          <div class="bc-form-row bc-form-row--compact">
+            <label>Public Key (64 Hex)</label>
+            <input type="text" id="vPubKey" placeholder="a1b2c3…" class="bc-poa-key-input" />
+            <button class="bc-btn bc-btn--xs" id="pasteOwnKey" title="Eigenen Key einfügen">
+              <i class="fas fa-paste"></i> Eigenen Key
+            </button>
+          </div>
+          <div class="bc-form-row bc-form-row--compact">
+            <label>Name (optional)</label>
+            <input type="text" id="vName" placeholder="Anzeigename" />
+          </div>
+          <div class="bc-form-row bc-form-row--compact">
+            <label>Endpoint (optional)</label>
+            <input type="text" id="vEndpoint" placeholder="https://node1.example.com" />
+          </div>
+          <div class="bc-form-row bc-form-row--actions">
+            <button class="bc-btn bc-btn--sm" id="saveValidatorBtn">
+              <i class="fas fa-check"></i> Speichern
+            </button>
+            <button class="bc-btn bc-btn--sm" id="cancelValidatorBtn">
+              Abbrechen
+            </button>
+            <span id="validatorFormStatus"></span>
+          </div>
+        </div>
+        <div id="validatorsBody"><p class="bc-placeholder">Lade Validatoren…</p></div>
+      </div>
+
+      <!-- Konsensus-Status -->
+      <div class="bc-poa-section">
+        <div class="bc-poa-section__title">
+          <i class="fas fa-vote-yea"></i> Aktuelle Voting-Runde
+        </div>
+        <div id="consensusBody"><p class="bc-placeholder">Kein aktives Voting.</p></div>
+      </div>
+
+      <!-- Fork-Erkennung -->
+      <div class="bc-poa-section">
+        <div class="bc-poa-section__title">
+          <i class="fas fa-code-branch"></i> Fork-Erkennung
+          <button class="bc-btn bc-btn--xs" id="scanForksBtn" style="margin-left:auto">
+            <i class="fas fa-magnifying-glass"></i> Jetzt scannen
+          </button>
+        </div>
+        <div id="forksBody"><p class="bc-placeholder">Noch nicht gescannt.</p></div>
+      </div>
+
+    </div><!-- /.bc-card__body -->
+  </div><!-- /#poaCard -->
+
+  <!-- ── Nutzer-Verwaltung (Admin) ──────────────────────────────────────── -->
+  <div class="bc-card">
+    <div class="bc-card__header">
+      <i class="fas fa-users"></i> Nutzer
+      <div class="bc-card__header-actions">
+        <input class="bc-search-input" id="userSearch" type="text"
+               placeholder="Name oder ID suchen…"
+               oninput="filterUsers(this.value)" />
+        <button class="bc-btn bc-btn--sm" id="refreshUsers">
+          <i class="fas fa-rotate"></i> Aktualisieren
+        </button>
+      </div>
+    </div>
+    <div class="bc-card__body">
+      <div id="usersBody"><p class="bc-placeholder">Lade Nutzer…</p></div>
+    </div>
+  </div>
+
+  <!-- ── Alle Dokumente (Admin-View) ─────────────────────────────────────── -->
+  <div class="bc-card">
+    <div class="bc-card__header">
+      <i class="fas fa-file-contract"></i> Alle Dokumente
+      <div class="bc-card__header-actions">
+        <input class="bc-search-input" id="adminDocSearch" type="text" placeholder="Suche: Titel, Tag, Owner…" />
+        <button class="bc-btn bc-btn--sm" id="refreshDocs">
+          <i class="fas fa-rotate"></i> Aktualisieren
+        </button>
+      </div>
+    </div>
+    <div class="bc-card__body">
+      <div id="docsBody"><p class="bc-placeholder">Lade Dokumente…</p></div>
+    </div>
+  </div>
+
+  <!-- ── Dokument hochladen ───────────────────────────────────────────────── -->
+  <div class="bc-card">
+    <div class="bc-card__header">
+      <i class="fas fa-upload"></i> Dokument hochladen
+    </div>
+    <div class="bc-card__body">
+      <!-- Unterstützte Formate + Max-Größe -->
+      <div class="bc-upload-info">
+        <div class="bc-upload-info__formats">
+          <span class="bc-upload-info__label"><i class="fas fa-circle-check"></i> Unterstützte Formate:</span>
+          <span class="bc-upload-info__badge">PDF</span>
+          <span class="bc-upload-info__badge">TXT</span>
+          <span class="bc-upload-info__badge">MD</span>
+          <span class="bc-upload-info__badge">JSON</span>
+          <span class="bc-upload-info__badge">CSV</span>
+          <span class="bc-upload-info__badge">XML</span>
+          <span class="bc-upload-info__badge">PNG</span>
+          <span class="bc-upload-info__badge">JPG</span>
+          <span class="bc-upload-info__badge">GIF</span>
+          <span class="bc-upload-info__badge">WEBP</span>
+          <span class="bc-upload-info__badge">ZIP</span>
+          <span class="bc-upload-info__badge">DOCX</span>
+          <span class="bc-upload-info__badge">XLSX</span>
+        </div>
+        <div class="bc-upload-info__limit">
+          <i class="fas fa-weight-hanging"></i> Max. Dateigröße: <strong>5 GiB</strong>
+        </div>
+      </div>
+      <form id="uploadForm" class="bc-upload-form">
+        <div class="bc-form-row">
+          <label>Datei</label>
+          <input type="file" id="uploadFile"
+            accept=".pdf,.txt,.md,.json,.csv,.xml,.png,.jpg,.jpeg,.gif,.webp,.zip,.docx,.xlsx,
+                    application/pdf,text/plain,text/markdown,application/json,text/csv,text/xml,
+                    application/xml,image/png,image/jpeg,image/gif,image/webp,
+                    application/zip,application/x-zip-compressed,
+                    application/vnd.openxmlformats-officedocument.wordprocessingml.document,
+                    application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            required />
+          <div id="fileInfo" class="bc-file-info" style="display:none">
+            <span id="fileName"></span>
+            <span id="fileSize" class="bc-file-info__size"></span>
+            <span id="fileSizeWarn" class="bc-file-info__warn" style="display:none">
+              <i class="fas fa-triangle-exclamation"></i> Datei zu groß (max. 5 GiB)
+            </span>
+            <span id="fileTypeWarn" class="bc-file-info__warn" style="display:none">
+              <i class="fas fa-triangle-exclamation"></i> Dateityp nicht unterstützt
+            </span>
+          </div>
+        </div>
+        <div class="bc-form-row">
+          <label>Titel (optional)</label>
+          <input type="text" id="uploadTitle" placeholder="Mein Dokument" />
+        </div>
+        <div class="bc-form-row">
+          <label>Tags (kommagetrennt)</label>
+          <input type="text" id="uploadTags" placeholder="intern, v1, legal" />
+        </div>
+        <div class="bc-form-row">
+          <label>Owner-ID (optional)</label>
+          <input type="text" id="uploadOwner" placeholder="user-1" />
+        </div>
+        <div class="bc-form-row bc-form-row--actions">
+          <button type="submit" class="bc-btn" id="uploadSubmit">
+            <i class="fas fa-cloud-upload-alt"></i> Hochladen
+          </button>
+          <span id="uploadStatus"></span>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ── Dokument-Detail-Modal (versteckt) ───────────────────────────────── -->
+  <div class="bc-modal" id="docModal" style="display:none">
+    <div class="bc-modal__box">
+      <div class="bc-modal__header">
+        <span id="modalTitle">Dokument</span>
+        <button class="bc-modal__close" id="modalClose">✕</button>
+      </div>
+      <div class="bc-modal__body" id="modalBody"></div>
+      <div class="bc-modal__footer">
+        <a class="bc-btn" id="modalDownload" href="#" target="_blank">
+          <i class="fas fa-download"></i> Download
+        </a>
+        <button class="bc-btn bc-btn--sm" id="modalHistory">
+          <i class="fas fa-clock-rotate-left"></i> Versionshistorie
+        </button>
+        <button class="bc-btn bc-btn--danger bc-btn--sm" id="modalDelete">
+          <i class="fas fa-trash"></i> Löschen
+        </button>
+      </div>
+    </div>
+  </div>
+  <div class="bc-modal-backdrop" id="modalBackdrop" style="display:none"></div>
+
+  <!-- ── Live WebSocket Feed ─────────────────────────────────────────────── -->
+  <div class="bc-card">
+    <div class="bc-card__header">
+      <i class="fas fa-rss"></i> Live-Events
+      <span class="bc-ws-indicator" id="wsIndicator">
+        <span class="bc-ws-indicator__dot bc-ws-indicator__dot--off"></span>
+        <span id="wsState">getrennt</span>
+      </span>
+      <button class="bc-btn bc-btn--sm" id="wsConnect">Verbinden</button>
+      <button class="bc-btn bc-btn--sm bc-btn--danger" id="wsDisconnect" style="display:none">Trennen</button>
+    </div>
+    <div class="bc-feed" id="wsFeed">
+      <p class="bc-placeholder">Noch keine Ereignisse.</p>
+    </div>
+  </div>
+
+</section>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function () {
+  "use strict";
+
+  const API_STATUS  = "{{ url_for('blockchain.mgmt_api_status') }}";
+  const API_DOCS    = "{{ url_for('blockchain.mgmt_api_documents') }}";
+  const API_BASE    = "{{ url_for('blockchain.mgmt_api_status') }}".replace("/api/status","");
+  const WS_URL      = "{{ ws_url }}";
+
+  // ── Status Badge ───────────────────────────────────────────────────────────
+  function setStatus(online, label) {
+    const badge = document.getElementById("statusBadge");
+    document.getElementById("statusText").textContent = label;
+    badge.classList.toggle("bc-status-badge--online",  online);
+    badge.classList.toggle("bc-status-badge--offline", !online);
+  }
+
+  // ── Status Card ────────────────────────────────────────────────────────────
+  function renderStatus(data) {
+    const el = document.getElementById("statusBody");
+    const c = data.chain || {};
+    el.innerHTML = `
+      <table class="bc-table">
+        <tbody>
+          <tr><th>Node-ID</th><td>${data.node_id ?? "–"}</td></tr>
+          <tr><th>Rolle</th><td><span class="bc-badge bc-badge--role">${data.role ?? "–"}</span></td></tr>
+          <tr><th>Block-Height</th><td>${c.block_height ?? "–"}</td></tr>
+          <tr><th>Letzter Hash</th><td class="bc-table__mono">${(c.latest_hash ?? "–").slice(0,24)}…</td></tr>
+          <tr><th>Chain valid</th><td>${c.is_valid ? '<span style="color:#4ade80">✓ Ja</span>' : '<span style="color:#f87171">✗ Nein</span>'}</td></tr>
+          <tr><th>Peers</th><td>${(data.peers ?? []).length}</td></tr>
+        </tbody>
+      </table>`;
+
+    const m = data.metrics || {};
+    document.getElementById("metricsBody").innerHTML = `
+      <table class="bc-table">
+        <tbody>
+          <tr><th>Dokumente gesamt</th><td>${c.total_documents ?? 0}</td></tr>
+          <tr><th>Hochgeladen</th><td>${m.documents_uploaded ?? 0}</td></tr>
+          <tr><th>Gelöscht</th><td>${m.documents_deleted ?? 0}</td></tr>
+          <tr><th>Requests</th><td>${m.requests_total ?? 0}</td></tr>
+          <tr><th>WS Verbindungen</th><td>${m.ws_connections ?? 0}</td></tr>
+          <tr><th>Uptime</th><td>${fmtUptime(m.uptime_secs ?? 0)}</td></tr>
+        </tbody>
+      </table>`;
+  }
+
+  function fmtUptime(s) {
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+    return `${h}h ${m}m ${sec}s`;
+  }
+
+  async function fetchStatus() {
+    try {
+      const r = await fetch(API_STATUS);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      setStatus(true, "Online");
+      renderStatus(data);
+    } catch(e) {
+      setStatus(false, "Offline");
+      document.getElementById("statusBody").innerHTML =
+        `<p class="bc-placeholder bc-placeholder--err"><i class="fas fa-triangle-exclamation"></i> ${e.message}</p>`;
+    }
+  }
+
+  // ── Nutzer ─────────────────────────────────────────────────────────────────
+  let allUsers = [];
+
+  function fmtBytes(b) {
+    if (b >= 1024 ** 3) return (b / 1024 ** 3).toFixed(2) + " GiB";
+    if (b >= 1024 ** 2) return (b / 1024 ** 2).toFixed(1) + " MiB";
+    if (b >= 1024)      return (b / 1024).toFixed(1) + " KiB";
+    return b + " B";
+  }
+
+  function renderUsers(list) {
+    const el = document.getElementById("usersBody");
+    if (!list.length) {
+      el.innerHTML = '<p class="bc-placeholder">Keine Nutzer gefunden.</p>';
+      return;
+    }
+    const rows = list.map(u => {
+      const pct     = Math.min(100, u.quota_pct ?? 0).toFixed(1);
+      const barCol  = pct > 90 ? "#f87171" : pct > 70 ? "#facc15" : "#4ade80";
+      const quotaInf = u.quota_bytes === 0 || u.quota_bytes >= Number.MAX_SAFE_INTEGER;
+      const quotaStr = quotaInf ? "∞" : fmtBytes(u.quota_bytes);
+      return `<tr>
+        <td class="bc-table__mono">${u.id}</td>
+        <td>${u.name}</td>
+        <td>${u.document_count ?? 0}</td>
+        <td>
+          <div style="display:flex;align-items:center;gap:.5rem;min-width:120px">
+            <div class="bc-size-bar" style="flex:1;margin:0">
+              <div class="bc-size-bar__fill"
+                   style="width:${pct}%;background:${barCol}"></div>
+            </div>
+            <span style="font-size:.78rem;white-space:nowrap;color:${barCol}">
+              ${fmtBytes(u.used_bytes)} / ${quotaStr}
+            </span>
+          </div>
+        </td>
+        <td>
+          <button class="bc-btn bc-btn--sm"
+                  onclick="openUserDocs('${u.id}','${u.name}')">
+            <i class="fas fa-eye"></i>
+          </button>
+          <button class="bc-btn bc-btn--sm bc-btn--danger"
+                  onclick="deleteUser('${u.id}','${u.name}')">
+            <i class="fas fa-trash"></i>
+          </button>
+        </td>
+      </tr>`;
+    }).join("");
+    el.innerHTML = `
+      <table class="bc-table bc-table--hover">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Name</th>
+            <th>Dokumente</th>
+            <th>Speicher</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  async function fetchUsers() {
+    document.getElementById("usersBody").innerHTML = '<p class="bc-placeholder">Lade…</p>';
+    try {
+      const r = await fetch(`${API_BASE}/api/users`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      allUsers = data.users ?? [];
+      renderUsers(allUsers);
+    } catch(e) {
+      document.getElementById("usersBody").innerHTML =
+        `<p class="bc-placeholder bc-placeholder--err"><i class="fas fa-triangle-exclamation"></i> ${e.message}</p>`;
+    }
+  }
+
+  window.filterUsers = function(q) {
+    q = q.toLowerCase();
+    renderUsers(q
+      ? allUsers.filter(u =>
+          u.name.toLowerCase().includes(q) || u.id.toLowerCase().includes(q))
+      : allUsers
+    );
+  };
+
+  window.openUserDocs = function(userId, userName) {
+    // Dokument-Suche nach diesem Owner vorausfüllen
+    document.getElementById("adminDocSearch").value = userId;
+    renderDocs(allDocs.filter(d => (d.owner ?? "") === userId));
+    document.getElementById("adminDocSearch").scrollIntoView({ behavior: "smooth" });
+  };
+
+  window.deleteUser = async function(userId, userName) {
+    if (!confirm(`Nutzer „${userName}" (${userId}) wirklich löschen?\nAlle seine Dokumente bleiben in der Chain, er kann sich jedoch nicht mehr anmelden.`)) return;
+    try {
+      const r = await fetch(`${API_BASE}/api/users/${userId}`, { method: "DELETE" });
+      const data = await r.json();
+      if (r.ok) {
+        wsLog(`Nutzer gelöscht: ${userName} (${userId})`, "bc-feed__line--warn");
+        fetchUsers();
+      } else {
+        alert("Fehler: " + (data.error ?? r.status));
+      }
+    } catch(e) { alert(e.message); }
+  };
+
+  // ── Dokumente ──────────────────────────────────────────────────────────────
+  let allDocs = [];
+
+  function renderDocs(list) {
+    const el = document.getElementById("docsBody");
+    if (!list.length) {
+      el.innerHTML = '<p class="bc-placeholder">Keine Dokumente vorhanden.</p>';
+      return;
+    }
+    const rows = list.map(doc => {
+      const hash      = doc.doc_id ?? "";
+      const shortHash = hash ? hash.slice(0, 14) + "…" : "–";
+      const name      = doc.title ?? doc.filename ?? "–";
+      const owner     = doc.owner ?? "–";
+      const tags      = (doc.tags ?? []).join(", ") || "–";
+      const ts        = doc.updated_at;                          // Unix-Sekunden (i64)
+      const tsStr     = ts ? new Date(ts * 1000).toLocaleString("de-DE") : "–";
+      return `<tr class="bc-doc-row" data-hash="${hash}" data-name="${name}">
+        <td class="bc-table__mono">${shortHash}</td>
+        <td>${name}</td>
+        <td>${owner}</td>
+        <td>${tags}</td>
+        <td>${tsStr}</td>
+        <td>
+          <button class="bc-btn bc-btn--sm bc-btn--icon" ${hash ? `onclick="openDoc('${hash}','${name}')"` : "disabled"}>
+            <i class="fas fa-eye"></i>
+          </button>
+        </td>
+      </tr>`;
+    }).join("");
+    el.innerHTML = `
+      <table class="bc-table bc-table--hover">
+        <thead><tr><th>Hash</th><th>Titel</th><th>Owner</th><th>Tags</th><th>Erstellt</th><th></th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  async function fetchDocs() {
+    document.getElementById("docsBody").innerHTML = '<p class="bc-placeholder">Lade…</p>';
+    try {
+      const r = await fetch(API_DOCS);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      allDocs = Array.isArray(data) ? data : (data.documents ?? data.data ?? []);
+      renderDocs(allDocs);
+    } catch(e) {
+      document.getElementById("docsBody").innerHTML =
+        `<p class="bc-placeholder bc-placeholder--err"><i class="fas fa-triangle-exclamation"></i> ${e.message}</p>`;
+    }
+  }
+
+  // ── Suche (client-side filter) ─────────────────────────────────────────────
+  document.getElementById("adminDocSearch").addEventListener("input", function() {
+    const q = this.value.toLowerCase();
+    const filtered = allDocs.filter(d =>
+      (d.title ?? d.filename ?? "").toLowerCase().includes(q) ||
+      (d.owner ?? "").toLowerCase().includes(q) ||
+      (d.tags ?? []).some(t => t.toLowerCase().includes(q))
+    );
+    renderDocs(filtered);
+  });
+
+  // ── Dokument-Detail Modal ──────────────────────────────────────────────────
+  window.openDoc = async function(hash, name) {
+    if (!hash) return;
+    document.getElementById("modalTitle").textContent = name;
+    document.getElementById("modalBody").innerHTML = '<p class="bc-placeholder">Lade…</p>';
+    document.getElementById("modalDownload").href = `${API_BASE}/api/documents/${hash}/download`;
+    document.getElementById("docModal").style.display = "";
+    document.getElementById("modalBackdrop").style.display = "";
+
+    // Delete-Button
+    document.getElementById("modalDelete").onclick = () => deleteDoc(hash);
+    // History-Button
+    document.getElementById("modalHistory").onclick = () => loadHistory(hash);
+
+    try {
+      const r = await fetch(`${API_BASE}/api/documents/${hash}`);
+      const data = await r.json();
+      const rows = Object.entries(data)
+        .map(([k,v]) => `<tr><th>${k}</th><td>${typeof v === "object" ? JSON.stringify(v) : v}</td></tr>`)
+        .join("");
+      document.getElementById("modalBody").innerHTML =
+        `<table class="bc-table"><tbody>${rows}</tbody></table>`;
+    } catch(e) {
+      document.getElementById("modalBody").innerHTML =
+        `<p class="bc-placeholder bc-placeholder--err">${e.message}</p>`;
+    }
+  };
+
+  function closeModal() {
+    document.getElementById("docModal").style.display = "none";
+    document.getElementById("modalBackdrop").style.display = "none";
+  }
+  document.getElementById("modalClose").addEventListener("click", closeModal);
+  document.getElementById("modalBackdrop").addEventListener("click", closeModal);
+
+  async function deleteDoc(hash) {
+    if (!hash) return;
+    if (!confirm("Dokument wirklich löschen?")) return;
+    try {
+      const r = await fetch(`${API_BASE}/api/documents/${hash}`, { method: "DELETE" });
+      const data = await r.json();
+      if (r.ok) {
+        closeModal();
+        fetchDocs();
+        wsLog("Dokument gelöscht: " + hash.slice(0,16), "bc-feed__line--warn");
+      } else {
+        alert("Fehler: " + (data.error ?? r.status));
+      }
+    } catch(e) { alert(e.message); }
+  }
+
+  async function loadHistory(hash) {
+    if (!hash) return;
+    document.getElementById("modalBody").innerHTML = '<p class="bc-placeholder">Lade Historie…</p>';
+    try {
+      const r = await fetch(`${API_BASE}/api/documents/${hash}/history`);
+      const data = await r.json();
+      const list = Array.isArray(data) ? data : (data.history ?? []);
+      if (!list.length) {
+        document.getElementById("modalBody").innerHTML = '<p class="bc-placeholder">Keine Versionen.</p>';
+        return;
+      }
+      const rows = list.map(v => `<tr>
+        <td>${v.version ?? "–"}</td>
+        <td class="bc-table__mono">${(v.hash ?? "–").slice(0,14)}…</td>
+        <td>${v.created_at ? new Date(v.created_at).toLocaleString("de-DE") : "–"}</td>
+      </tr>`).join("");
+      document.getElementById("modalBody").innerHTML =
+        `<table class="bc-table"><thead><tr><th>Version</th><th>Hash</th><th>Datum</th></tr></thead><tbody>${rows}</tbody></table>`;
+    } catch(e) {
+      document.getElementById("modalBody").innerHTML =
+        `<p class="bc-placeholder bc-placeholder--err">${e.message}</p>`;
+    }
+  }
+
+  // ── Upload-Datei Validierung ───────────────────────────────────────────────
+  const MAX_BYTES = 5 * 1024 * 1024 * 1024; // 5 GiB (identisch mit Server)
+
+  const ALLOWED_MIME = new Set([
+    "application/pdf",
+    "text/plain", "text/markdown", "text/csv", "text/xml",
+    "application/json", "application/xml",
+    "image/png", "image/jpeg", "image/gif", "image/webp",
+    "application/zip", "application/x-zip-compressed",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ]);
+
+  const ALLOWED_EXT = new Set([
+    "pdf","txt","md","json","csv","xml",
+    "png","jpg","jpeg","gif","webp",
+    "zip","docx","xlsx",
+  ]);
+
+  function validateFile(file) {
+    const ext  = (file.name.split(".").pop() ?? "").toLowerCase();
+    const mime = file.type || "";
+    const sizeOk = file.size <= MAX_BYTES;
+    const typeOk = ALLOWED_MIME.has(mime) || ALLOWED_EXT.has(ext);
+    return { sizeOk, typeOk };
+  }
+
+  document.getElementById("uploadFile").addEventListener("change", function () {
+    const file = this.files[0];
+    const info     = document.getElementById("fileInfo");
+    const nameEl   = document.getElementById("fileName");
+    const sizeEl   = document.getElementById("fileSize");
+    const sizeWarn = document.getElementById("fileSizeWarn");
+    const typeWarn = document.getElementById("fileTypeWarn");
+    const submit   = document.getElementById("uploadSubmit");
+
+    if (!file) {
+      info.style.display = "none";
+      submit.disabled = false;
+      return;
+    }
+
+    const { sizeOk, typeOk } = validateFile(file);
+    const pct = Math.min(100, (file.size / MAX_BYTES) * 100);
+
+    nameEl.textContent = file.name;
+    sizeEl.textContent = fmtBytes(file.size);
+    sizeEl.style.color = sizeOk ? "#4ade80" : "#f87171";
+    sizeWarn.style.display = sizeOk ? "none" : "";
+    typeWarn.style.display = typeOk ? "none" : "";
+    info.style.display = "";
+
+    // Fortschrittsbalken für Dateigröße
+    let bar = document.getElementById("fileSizeBar");
+    if (!bar) {
+      bar = document.createElement("div");
+      bar.id = "fileSizeBar";
+      bar.className = "bc-size-bar";
+      bar.innerHTML = '<div class="bc-size-bar__fill"></div>';
+      info.appendChild(bar);
+    }
+    const fill = bar.querySelector(".bc-size-bar__fill");
+    fill.style.width = pct + "%";
+    fill.style.background = sizeOk ? (pct > 80 ? "#facc15" : "#4ade80") : "#f87171";
+
+    submit.disabled = !sizeOk || !typeOk;
+    submit.title    = !typeOk ? "Dateityp nicht unterstützt"
+                    : !sizeOk ? "Datei überschreitet 5 GiB Limit"
+                    : "";
+  });
+
+  // ── Upload ─────────────────────────────────────────────────────────────────
+  document.getElementById("uploadForm").addEventListener("submit", async function(e) {
+    e.preventDefault();
+    const file  = document.getElementById("uploadFile").files[0];
+    const title = document.getElementById("uploadTitle").value.trim();
+    const tags  = document.getElementById("uploadTags").value.trim();
+    const owner = document.getElementById("uploadOwner").value.trim();
+    const stat  = document.getElementById("uploadStatus");
+
+    if (!file) return;
+
+    const { sizeOk, typeOk } = validateFile(file);
+    if (!typeOk) {
+      stat.textContent = "✗ Dateityp nicht unterstützt";
+      stat.style.color = "#f87171";
+      return;
+    }
+    if (!sizeOk) {
+      stat.textContent = `✗ Datei zu groß (${fmtBytes(file.size)} / max. 5 GiB)`;
+      stat.style.color = "#f87171";
+      return;
+    }
+
+    stat.textContent = "Lädt hoch…";
+    stat.style.color = "#facc15";
+
+    const fd = new FormData();
+    fd.append("file", file);
+    if (title) fd.append("title", title);
+    if (tags)  fd.append("tags",  tags);
+    if (owner) fd.append("owner", owner);
+
+    try {
+      const r = await fetch(`${API_BASE}/api/documents`, { method: "POST", body: fd });
+      const data = await r.json();
+      if (r.ok) {
+        stat.textContent = "✓ Hochgeladen";
+        stat.style.color = "#4ade80";
+        document.getElementById("uploadForm").reset();
+        fetchDocs();
+      } else {
+        stat.textContent = "✗ " + (data.error ?? `HTTP ${r.status}`);
+        stat.style.color = "#f87171";
+      }
+    } catch(e) {
+      stat.textContent = "✗ " + e.message;
+      stat.style.color = "#f87171";
+    }
+  });
+
+  // ── WebSocket ──────────────────────────────────────────────────────────────
+  let ws = null;
+
+  function wsLog(msg, cls = "") {
+    const feed = document.getElementById("wsFeed");
+    feed.querySelector(".bc-placeholder")?.remove();
+    const line = document.createElement("div");
+    line.className = `bc-feed__line ${cls}`;
+    line.textContent = `[${new Date().toLocaleTimeString("de-DE")}] ${msg}`;
+    feed.appendChild(line);
+    feed.scrollTop = feed.scrollHeight;
+  }
+
+  function wsConnect() {
+    if (ws) ws.close();
+    document.getElementById("wsIndicator").querySelector(".bc-ws-indicator__dot")
+      .className = "bc-ws-indicator__dot bc-ws-indicator__dot--connecting";
+    document.getElementById("wsState").textContent = "verbinde…";
+
+    ws = new WebSocket(WS_URL);
+    ws.onopen    = () => {
+      document.getElementById("wsIndicator").querySelector(".bc-ws-indicator__dot")
+        .className = "bc-ws-indicator__dot bc-ws-indicator__dot--on";
+      document.getElementById("wsState").textContent   = "verbunden";
+      document.getElementById("wsConnect").style.display    = "none";
+      document.getElementById("wsDisconnect").style.display = "";
+      wsLog("Verbindung hergestellt.", "bc-feed__line--ok");
+    };
+    ws.onmessage = (e) => {
+      let text = e.data;
+      try { text = JSON.stringify(JSON.parse(e.data), null, 0); } catch {}
+      wsLog(text);
+    };
+    ws.onerror   = () => wsLog("WebSocket-Fehler.", "bc-feed__line--err");
+    ws.onclose   = (e) => {
+      document.getElementById("wsIndicator").querySelector(".bc-ws-indicator__dot")
+        .className = "bc-ws-indicator__dot bc-ws-indicator__dot--off";
+      document.getElementById("wsState").textContent   = "getrennt";
+      document.getElementById("wsConnect").style.display    = "";
+      document.getElementById("wsDisconnect").style.display = "none";
+      wsLog(`Verbindung getrennt (Code ${e.code}).`, "bc-feed__line--warn");
+      ws = null;
+    };
+  }
+
+  document.getElementById("wsConnect").addEventListener("click", wsConnect);
+  document.getElementById("wsDisconnect").addEventListener("click", () => ws?.close(1000));
+  document.getElementById("refreshStatus").addEventListener("click", fetchStatus);
+  document.getElementById("refreshDocs").addEventListener("click", fetchDocs);
+  document.getElementById("refreshUsers").addEventListener("click", fetchUsers);
+
+  // ── PoA / Validators ──────────────────────────────────────────────────────
+  let selfPubKey = "";
+
+  async function fetchSelfPubKey() {
+    try {
+      const r = await fetch(`${API_BASE}/api/v1/validators/self`, { headers: adminHeaders() });
+      if (!r.ok) return;
+      const d = await r.json();
+      selfPubKey = d.public_key_hex ?? "";
+      document.getElementById("selfPubKey").textContent = selfPubKey || "–";
+    } catch(_) {}
+  }
+
+  document.getElementById("copyPubKey").addEventListener("click", () => {
+    if (!selfPubKey) return;
+    navigator.clipboard.writeText(selfPubKey).then(() => {
+      const btn = document.getElementById("copyPubKey");
+      btn.innerHTML = '<i class="fas fa-check"></i>';
+      setTimeout(() => { btn.innerHTML = '<i class="fas fa-copy"></i>'; }, 1500);
+    });
+  });
+
+  document.getElementById("pasteOwnKey").addEventListener("click", () => {
+    if (selfPubKey) document.getElementById("vPubKey").value = selfPubKey;
+  });
+
+  // Validator-Liste rendern
+  let allValidators = [];
+
+  function renderValidators(list) {
+    const el = document.getElementById("validatorsBody");
+    // PoA-Badge aktualisieren
+    const badge = document.getElementById("poaBadge");
+    if (list.length === 0) {
+      badge.textContent = "PoA inaktiv";
+      badge.style.cssText = "background:rgba(107,114,128,.15);color:#6b7280;border-radius:999px;padding:.15rem .6rem;font-size:.75rem";
+      el.innerHTML = '<p class="bc-placeholder">Keine Validatoren registriert — PoA ist deaktiviert.</p>';
+      return;
+    }
+    const active = list.filter(v => v.active).length;
+    badge.textContent = `PoA aktiv — ${active}/${list.length} Validatoren`;
+    badge.style.cssText = "background:rgba(74,222,128,.12);color:#4ade80;border:1px solid rgba(74,222,128,.25);border-radius:999px;padding:.15rem .65rem;font-size:.75rem;font-weight:600";
+
+    const rows = list.map(v => `
+      <tr class="bc-validator-row">
+        <td class="bc-table__mono" style="font-size:.8rem">${v.node_id}</td>
+        <td>${v.name || '<span style="color:#6b7280">–</span>'}</td>
+        <td class="bc-table__mono" style="font-size:.72rem;color:#86efac">
+          ${v.public_key_hex ? v.public_key_hex.slice(0,16) + '…' : '–'}
+        </td>
+        <td>${v.blocks_signed ?? 0}</td>
+        <td>
+          <span class="bc-validator-status ${v.active ? 'bc-validator-status--active' : 'bc-validator-status--inactive'}">
+            <i class="fas ${v.active ? 'fa-circle-check' : 'fa-circle-xmark'}"></i>
+            ${v.active ? 'Aktiv' : 'Inaktiv'}
+          </span>
+        </td>
+        <td>
+          <button class="bc-btn bc-btn--xs"
+                  title="${v.active ? 'Deaktivieren' : 'Aktivieren'}"
+                  onclick="toggleValidator('${v.node_id}',${!v.active})">
+            <i class="fas ${v.active ? 'fa-toggle-on' : 'fa-toggle-off'}"></i>
+          </button>
+          <button class="bc-btn bc-btn--xs bc-btn--danger" style="margin-left:.3rem"
+                  title="Entfernen"
+                  onclick="removeValidator('${v.node_id}')">
+            <i class="fas fa-trash"></i>
+          </button>
+        </td>
+      </tr>`).join("");
+
+    el.innerHTML = `
+      <table class="bc-table bc-table--hover">
+        <thead><tr>
+          <th>Node-ID</th><th>Name</th><th>Public Key</th>
+          <th>Blöcke</th><th>Status</th><th></th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  async function fetchValidators() {
+    try {
+      const r = await fetch(`${API_BASE}/api/v1/validators`, { headers: adminHeaders() });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = await r.json();
+      allValidators = d.validators ?? [];
+      renderValidators(allValidators);
+    } catch(e) {
+      document.getElementById("validatorsBody").innerHTML =
+        `<p class="bc-placeholder bc-placeholder--err"><i class="fas fa-triangle-exclamation"></i> ${e.message}</p>`;
+    }
+  }
+
+  window.toggleValidator = async function(nodeId, active) {
+    try {
+      const r = await fetch(`${API_BASE}/api/v1/validators/${encodeURIComponent(nodeId)}/activate`, {
+        method: "POST",
+        headers: { ...adminHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({ active }),
+      });
+      const d = await r.json();
+      if (r.ok) {
+        wsLog(`Validator ${nodeId} ${active ? "aktiviert" : "deaktiviert"}`, "bc-feed__line--ok");
+        fetchValidators();
+      } else {
+        alert("Fehler: " + (d.error ?? r.status));
+      }
+    } catch(e) { alert(e.message); }
+  };
+
+  window.removeValidator = async function(nodeId) {
+    if (!confirm(`Validator „${nodeId}" wirklich entfernen?\nDanach können Blöcke dieser Node nicht mehr akzeptiert werden.`)) return;
+    try {
+      const r = await fetch(`${API_BASE}/api/v1/validators/${encodeURIComponent(nodeId)}`, {
+        method: "DELETE", headers: adminHeaders(),
+      });
+      const d = await r.json();
+      if (r.ok) {
+        wsLog(`Validator entfernt: ${nodeId}`, "bc-feed__line--warn");
+        fetchValidators();
+      } else {
+        alert("Fehler: " + (d.error ?? r.status));
+      }
+    } catch(e) { alert(e.message); }
+  };
+
+  // Add-Validator Formular
+  document.getElementById("addValidatorBtn").addEventListener("click", () => {
+    document.getElementById("addValidatorForm").style.display = "";
+    document.getElementById("addValidatorBtn").style.display = "none";
+  });
+  document.getElementById("cancelValidatorBtn").addEventListener("click", () => {
+    document.getElementById("addValidatorForm").style.display = "none";
+    document.getElementById("addValidatorBtn").style.display = "";
+    document.getElementById("validatorFormStatus").textContent = "";
+  });
+
+  document.getElementById("saveValidatorBtn").addEventListener("click", async () => {
+    const nodeId  = document.getElementById("vNodeId").value.trim();
+    const pubKey  = document.getElementById("vPubKey").value.trim();
+    const name    = document.getElementById("vName").value.trim();
+    const endpoint= document.getElementById("vEndpoint").value.trim();
+    const stat    = document.getElementById("validatorFormStatus");
+
+    if (!nodeId || !pubKey) {
+      stat.textContent = "Node-ID und Public Key sind erforderlich.";
+      stat.style.color = "#f87171";
+      return;
+    }
+    if (pubKey.length !== 64 || !/^[0-9a-fA-F]+$/.test(pubKey)) {
+      stat.textContent = "Public Key muss genau 64 Hex-Zeichen haben.";
+      stat.style.color = "#f87171";
+      return;
+    }
+    stat.textContent = "Speichere…";
+    stat.style.color = "#facc15";
+    try {
+      const r = await fetch(`${API_BASE}/api/v1/validators`, {
+        method: "POST",
+        headers: { ...adminHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({ node_id: nodeId, public_key_hex: pubKey, name, endpoint }),
+      });
+      const d = await r.json();
+      if (r.ok) {
+        stat.textContent = "✓ Validator hinzugefügt";
+        stat.style.color = "#4ade80";
+        wsLog(`Validator hinzugefügt: ${nodeId}`, "bc-feed__line--ok");
+        setTimeout(() => {
+          document.getElementById("addValidatorForm").style.display = "none";
+          document.getElementById("addValidatorBtn").style.display = "";
+          document.getElementById("vNodeId").value = "";
+          document.getElementById("vPubKey").value = "";
+          document.getElementById("vName").value = "";
+          document.getElementById("vEndpoint").value = "";
+          stat.textContent = "";
+        }, 1200);
+        fetchValidators();
+      } else {
+        stat.textContent = "✗ " + (d.error ?? `HTTP ${r.status}`);
+        stat.style.color = "#f87171";
+      }
+    } catch(e) {
+      stat.textContent = "✗ " + e.message;
+      stat.style.color = "#f87171";
+    }
+  });
+
+  // ── Konsensus-Status ───────────────────────────────────────────────────────
+  async function fetchConsensus() {
+    const el = document.getElementById("consensusBody");
+    try {
+      const r = await fetch(`${API_BASE}/api/v1/consensus/status`, { headers: adminHeaders() });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = await r.json();
+
+      if (!d.active) {
+        el.innerHTML = '<p class="bc-placeholder">Keine aktive Voting-Runde.</p>';
+        return;
+      }
+      const t = d.tally ?? {};
+      const pct = t.total_validators > 0
+        ? Math.round((t.accepts / t.threshold) * 100)
+        : 0;
+      const banner = d.finalized
+        ? (d.accepted
+            ? `<div class="bc-consensus-banner bc-consensus-banner--ok"><i class="fas fa-circle-check"></i> Konsensus erreicht</div>`
+            : `<div class="bc-consensus-banner bc-consensus-banner--fail"><i class="fas fa-circle-xmark"></i> Konsensus abgelehnt</div>`)
+        : `<div class="bc-consensus-banner bc-consensus-banner--pend"><i class="fas fa-hourglass-half"></i> Abstimmung läuft — Runde ${d.round}</div>`;
+
+      el.innerHTML = `
+        ${banner}
+        <div style="font-size:.82rem;color:#9ca3af;margin-bottom:.75rem">
+          Block: <code class="bc-table__mono" style="font-size:.8rem">${(d.block_hash ?? "").slice(0,24)}…</code>
+          &nbsp;·&nbsp; Proposer: <strong>${d.proposer_id ?? "–"}</strong>
+        </div>
+        <div class="bc-vote-tally">
+          <div class="bc-vote-box bc-vote-box--yes">
+            <div class="bc-vote-box__num">${t.accepts ?? 0}</div>
+            <div class="bc-vote-box__label">Ja</div>
+          </div>
+          <div class="bc-vote-box bc-vote-box--no">
+            <div class="bc-vote-box__num">${t.rejects ?? 0}</div>
+            <div class="bc-vote-box__label">Nein</div>
+          </div>
+          <div class="bc-vote-box bc-vote-box--abs">
+            <div class="bc-vote-box__num">${t.abstentions ?? 0}</div>
+            <div class="bc-vote-box__label">Enthaltung</div>
+          </div>
+          <div class="bc-vote-box bc-vote-box--need">
+            <div class="bc-vote-box__num">${t.threshold ?? "–"}</div>
+            <div class="bc-vote-box__label">Benötigt</div>
+          </div>
+        </div>
+        <div class="bc-vote-progress">
+          <div class="bc-vote-progress__fill"
+               style="width:${Math.min(100,pct)}%;background:${pct>=100?'#4ade80':pct>50?'#facc15':'#6366f1'}">
+          </div>
+        </div>
+        <div style="font-size:.75rem;color:#6b7280;text-align:right">
+          ${t.accepts ?? 0} / ${t.threshold ?? "?"} Stimmen (${Math.min(100,pct)}%)
+        </div>`;
+    } catch(e) {
+      el.innerHTML = `<p class="bc-placeholder bc-placeholder--err">${e.message}</p>`;
+    }
+  }
+
+  // ── Fork-Erkennung ─────────────────────────────────────────────────────────
+  async function fetchForks() {
+    const el = document.getElementById("forksBody");
+    el.innerHTML = '<p class="bc-placeholder">Scanne…</p>';
+    try {
+      const r = await fetch(`${API_BASE}/api/v1/forks`, { headers: adminHeaders() });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = await r.json();
+
+      if ((d.forks_detected ?? 0) === 0) {
+        el.innerHTML = '<p class="bc-placeholder" style="color:#4ade80"><i class="fas fa-circle-check"></i> Keine Forks erkannt — Chain ist konsistent.</p>';
+        return;
+      }
+
+      const groups = (d.fork_groups ?? []).map((group, gi) => {
+        const candidates = group.map(c => `
+          <div class="bc-fork-candidate">
+            <span class="bc-fork-candidate__hash">${c.block_hash?.slice(0,20)}…</span>
+            <span>Index <strong>#${c.block_index}</strong></span>
+            <span>Signer: <code>${c.signer_id ?? "–"}</code></span>
+            <span>Folge-Blöcke: <strong>${c.chain_length_after}</strong></span>
+            <span class="${c.signature_valid ? 'bc-fork-sig-ok' : 'bc-fork-sig-bad'}">
+              <i class="fas ${c.signature_valid ? 'fa-shield-check' : 'fa-shield-xmark'}"></i>
+              Sig ${c.signature_valid ? 'OK' : 'INVALID'}
+            </span>
+          </div>`).join("");
+
+        return `<div class="bc-fork-group">
+          <div class="bc-fork-group__title">
+            <i class="fas fa-code-branch"></i> Fork-Gruppe ${gi+1} — ${group.length} konkurrierende Blöcke
+          </div>
+          ${candidates}
+          <button class="bc-btn bc-btn--xs" style="margin-top:.5rem"
+                  onclick="resolveFork(${JSON.stringify(JSON.stringify(group))})">
+            <i class="fas fa-gavel"></i> Auflösen
+          </button>
+        </div>`;
+      }).join("");
+
+      el.innerHTML = `<div style="margin-bottom:.5rem;font-size:.85rem;color:#fb923c;font-weight:600">
+        <i class="fas fa-triangle-exclamation"></i> ${d.forks_detected} Fork-Gruppe(n) erkannt!
+      </div>${groups}`;
+    } catch(e) {
+      el.innerHTML = `<p class="bc-placeholder bc-placeholder--err">${e.message}</p>`;
+    }
+  }
+
+  window.resolveFork = async function(candidatesJson) {
+    let candidates;
+    try { candidates = JSON.parse(candidatesJson); } catch { return; }
+    try {
+      const r = await fetch(`${API_BASE}/api/v1/forks/resolve`, {
+        method: "POST",
+        headers: { ...adminHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({ candidates }),
+      });
+      const d = await r.json();
+      if (r.ok) {
+        wsLog(`Fork aufgelöst → Winner: ${d.winning_hash?.slice(0,16)}… (${d.reason})`, "bc-feed__line--ok");
+        fetchForks();
+      } else {
+        alert("Fehler: " + (d.error ?? r.status));
+      }
+    } catch(e) { alert(e.message); }
+  };
+
+  // Refresh-Button für den ganzen PoA-Panel
+  document.getElementById("refreshPoa").addEventListener("click", fetchPoa);
+  document.getElementById("scanForksBtn").addEventListener("click", fetchForks);
+
+  async function fetchPoa() {
+    await Promise.all([fetchSelfPubKey(), fetchValidators(), fetchConsensus()]);
+  }
+
+  // ── Hilfsfunktion: Admin-Header ────────────────────────────────────────────
+  function adminHeaders() {
+    // API_KEY aus sessionStorage (falls über Login gesetzt) oder aus globalem Kontext
+    const key = sessionStorage.getItem("stone_api_key") || window.STONE_ADMIN_KEY || "";
+    return key ? { "x-api-key": key } : {};
+  }
+
+  // ── Init ───────────────────────────────────────────────────────────────────
+  fetchStatus();
+  fetchDocs();
+  fetchUsers();
+  fetchPoa();
+  setInterval(fetchStatus, 30_000);
+  setInterval(fetchConsensus, 10_000); // Voting-Status öfter pollen
+
+}());
+</script>
+{% endblock %}
