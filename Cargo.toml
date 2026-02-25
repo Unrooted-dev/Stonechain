@@ -81,3 +81,4 @@ anyhow          = "1.0"
 futures-util    = { version = "0.3", default-features = false, features = ["std"] }
 hostname        = "0.3"
 url             = "2.5"
+dotenvy         = "0.15"

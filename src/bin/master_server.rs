@@ -154,9 +154,15 @@ fn require_admin(headers: &HeaderMap, state: &AppState) -> Result<(), Response> 
 // ─── API-Key laden ────────────────────────────────────────────────────────────
 
 fn load_api_key() -> String {
+    // Priorität 1: STONE_CLUSTER_API_KEY (gesetzt von stone_init.py via .env)
+    // Priorität 2: STONE_API_KEY (Legacy/manuell)
+    // Priorität 3: stone_data/token.bin
+    // Priorität 4: Neu generieren und in token.bin speichern
     for var in ["STONE_CLUSTER_API_KEY", "STONE_API_KEY"] {
         if let Ok(v) = std::env::var(var) {
+            let v = v.trim().to_string();
             if !v.is_empty() {
+                println!("[auth] API-Key aus Umgebungsvariable {var}");
                 return v;
             }
         }
@@ -274,7 +280,136 @@ async fn handle_metrics(
     Ok((StatusCode::OK, axum::Json(state.node.snapshot_metrics())))
 }
 
-/// GET /api/v1/chain/verify
+/// GET /api/v1/network — P2P-Netzwerkstatus + Server-Ressourcen
+async fn handle_network_stats(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, Response> {
+    require_admin(&headers, &state)?;
+
+    // ── P2P-Status vom Swarm holen ─────────────────────────────────────────
+    let net = if let Some(h) = &state.network {
+        h.get_status().await
+    } else {
+        None
+    };
+
+    let (local_peer_id, connected_peers, total_known, mesh_size, p2p_peers) =
+        if let Some(ref s) = net {
+            (
+                s.local_peer_id.clone(),
+                s.connected_peers,
+                s.total_known_peers,
+                s.gossipsub_mesh_size,
+                s.peers.iter().map(|p| json!({
+                    "peer_id":        p.peer_id,
+                    "addresses":      p.addresses,
+                    "connected":      p.connected,
+                    "agent":          p.agent_version,
+                    "last_seen_secs": p.last_seen_ago_secs,
+                    "blocks_received": p.blocks_received,
+                    "in_mesh":        p.in_gossipsub_mesh,
+                })).collect::<Vec<_>>(),
+            )
+        } else {
+            (String::from("–"), 0, 0, 0, vec![])
+        };
+
+    // ── Server-Ressourcen (plattformübergreifend via /proc oder sysinfo) ──
+    // Uptime in Sekunden
+    let uptime_secs = (chrono::Utc::now().timestamp() - state.node.started_at) as u64;
+
+    // Prozess-Speicher (RSS) via /proc/self/status auf Linux, auf macOS via sysctl
+    let memory_rss_kb: u64 = {
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::read_to_string("/proc/self/status")
+                .unwrap_or_default()
+                .lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        }
+        #[cfg(not(target_os = "linux"))]
+        { 0 }
+    };
+
+    // CPU-Zeit (user + system) in Millisekunden via /proc/self/stat
+    let cpu_time_ms: u64 = {
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::read_to_string("/proc/self/stat")
+                .unwrap_or_default()
+                .split_whitespace()
+                .enumerate()
+                .filter(|(i, _)| *i == 13 || *i == 14) // utime + stime (CLK_TCK=100)
+                .map(|(_, v)| v.parse::<u64>().unwrap_or(0))
+                .sum::<u64>() * 10 // CLK_TCK=100 → *10 = ms
+        }
+        #[cfg(not(target_os = "linux"))]
+        { 0 }
+    };
+
+    // Disk-Nutzung des stone_data-Verzeichnisses
+    let data_dir_bytes: u64 = {
+        fn dir_size(path: &std::path::Path) -> u64 {
+            std::fs::read_dir(path)
+                .map(|e| e.filter_map(|e| e.ok())
+                    .map(|e| {
+                        let meta = e.metadata().ok();
+                        if meta.as_ref().map(|m| m.is_dir()).unwrap_or(false) {
+                            dir_size(&e.path())
+                        } else {
+                            meta.map(|m| m.len()).unwrap_or(0)
+                        }
+                    }).sum())
+                .unwrap_or(0)
+        }
+        dir_size(std::path::Path::new(&stone::blockchain::data_dir()))
+    };
+
+    // Metriken
+    let m = state.node.snapshot_metrics();
+
+    Ok((StatusCode::OK, axum::Json(json!({
+        "p2p": {
+            "enabled":          state.network.is_some(),
+            "local_peer_id":    local_peer_id,
+            "connected_peers":  connected_peers,
+            "total_known":      total_known,
+            "gossipsub_mesh":   mesh_size,
+            "peers":            p2p_peers,
+        },
+        "server": {
+            "uptime_secs":      uptime_secs,
+            "uptime_human":     format_uptime(uptime_secs),
+            "memory_rss_kb":    memory_rss_kb,
+            "cpu_time_ms":      cpu_time_ms,
+            "data_dir_bytes":   data_dir_bytes,
+        },
+        "chain": {
+            "blocks":           m.peers_total,   // peers_total als Proxy-Feld
+            "requests_total":   m.requests_total,
+            "sync_runs":        m.sync_runs,
+            "sync_success":     m.sync_success,
+            "sync_failure":     m.sync_failure,
+            "docs_uploaded":    m.documents_uploaded,
+            "ws_connections":   m.ws_connections,
+        }
+    }))))
+}
+
+fn format_uptime(secs: u64) -> String {
+    let d = secs / 86400;
+    let h = (secs % 86400) / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if d > 0 { format!("{d}d {h}h {m}m") }
+    else if h > 0 { format!("{h}h {m}m {s}s") }
+    else if m > 0 { format!("{m}m {s}s") }
+    else { format!("{s}s") }
+}
 async fn handle_verify(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -2466,6 +2601,7 @@ fn build_router(state: AppState) -> Router {
         // Status & Metriken (Admin)
         .route("/api/v1/status", get(handle_status))
         .route("/api/v1/metrics", get(handle_metrics))
+        .route("/api/v1/network", get(handle_network_stats))
         .route("/api/v1/chain/verify", get(handle_verify))
         // Blöcke (Admin)
         .route("/api/v1/blocks", get(handle_list_blocks))
@@ -2541,6 +2677,17 @@ fn build_router(state: AppState) -> Router {
 
 #[tokio::main]
 async fn main() {
+    // ── .env laden (falls vorhanden) ──────────────────────────────────────────
+    // Liest die .env Datei im aktuellen Verzeichnis und setzt die Variablen als
+    // Umgebungsvariablen. Bereits gesetzte Variablen werden NICHT überschrieben
+    // (dotenvy::dotenv_override() würde .env bevorzugen).
+    // Reihenfolge: bestehende Env-Vars > .env > token.bin (Fallback)
+    match dotenvy::dotenv() {
+        Ok(path) => println!("[master] .env geladen: {}", path.display()),
+        Err(dotenvy::Error::Io(_)) => { /* .env nicht gefunden – kein Fehler */ }
+        Err(e) => eprintln!("[master] .env Warnung: {e}"),
+    }
+
     std::fs::create_dir_all(data_dir()).expect("DATA_DIR anlegen");
     ChunkStore::new().expect("ChunkStore anlegen");
 

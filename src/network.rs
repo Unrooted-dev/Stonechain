@@ -464,6 +464,19 @@ struct SwarmTask {
     >,
 }
 
+/// Entfernt die `/p2p/<PeerId>`-Komponente am Ende einer Multiaddr.
+/// mDNS liefert Adressen wie `/ip4/1.2.3.4/tcp/7654/p2p/12D3Koo…`.
+/// libp2p lehnt es ab, wenn man diese an `DialOpts::peer_id(...).addresses(…)`
+/// übergibt — die PeerId wäre dann doppelt vorhanden → EINVAL (os error 22).
+fn strip_p2p_suffix(addr: libp2p::Multiaddr) -> libp2p::Multiaddr {
+    use libp2p::multiaddr::Protocol;
+    let without: libp2p::Multiaddr = addr
+        .into_iter()
+        .filter(|p| !matches!(p, Protocol::P2p(_)))
+        .collect();
+    without
+}
+
 impl SwarmTask {
     async fn run(mut self) {
         let listen_addr: Multiaddr = match self.config.listen_addr.parse() {
@@ -668,6 +681,35 @@ impl SwarmTask {
             }
 
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                let local = *self.swarm.local_peer_id();
+                // Selbst-Dial-Fehler (eigene VPN/Multi-Interface-Adressen) unterdrücken
+                if peer_id == Some(local) {
+                    return;
+                }
+                // Harmlose Race-Conditions komplett stumm schalten:
+                // - "Already connected" / "Pending" → bereits verbunden, kein Problem
+                // - os error 48 (EADDRINUSE, macOS) → TCP-Quelladresse kurz belegt, Peer
+                //   verbindet sich gleichzeitig von der anderen Seite → ignorieren
+                // - os error 22 (EINVAL) → /p2p/-Suffix im Dial-Addr, bereits gefixt aber
+                //   kann noch aus alten Kademlia-Einträgen kommen → ignorieren
+                let err_str = error.to_string();
+                let is_harmless = err_str.contains("Already connected")
+                    || err_str.contains("Pending connection")
+                    || err_str.contains("WrongPeerId")
+                    || err_str.contains("os error 48")   // EADDRINUSE (macOS)
+                    || err_str.contains("os error 22")   // EINVAL
+                    || err_str.contains("Address already in use")
+                    || err_str.contains("Invalid argument");
+
+                // Wenn der Peer jetzt bereits verbunden ist, war der Fehler eine Race-Condition
+                let peer_now_connected = peer_id
+                    .map(|id| self.swarm.is_connected(&id))
+                    .unwrap_or(false);
+
+                if is_harmless || peer_now_connected {
+                    // Nur als Debug ausgeben, kein Fehler
+                    return;
+                }
                 eprintln!("[p2p] Verbindungsfehler zu {:?}: {error}", peer_id);
             }
 
@@ -704,11 +746,77 @@ impl SwarmTask {
 
             // ── mDNS ──────────────────────────────────────────────────────────
             StoneBehaviourEvent::Mdns(mdns::Event::Discovered(list)) => {
+                let local_peer = *self.swarm.local_peer_id();
+
+                // Adressen je Peer sammeln (Original-Addrs inkl. /p2p-Suffix behalten)
+                let mut by_peer: std::collections::HashMap<
+                    libp2p::PeerId,
+                    Vec<libp2p::Multiaddr>,
+                > = std::collections::HashMap::new();
+
                 for (peer_id, addr) in list {
+                    if peer_id == local_peer {
+                        continue; // Selbst-Dial verhindern
+                    }
                     println!("[p2p] mDNS entdeckt: {peer_id} @ {addr}");
-                    self.swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
-                    if let Err(e) = self.swarm.dial(addr) {
-                        eprintln!("[p2p] mDNS-Dial: {e}");
+                    // Kademlia bekommt die Adresse OHNE /p2p-Suffix
+                    let addr_bare = strip_p2p_suffix(addr.clone());
+                    self.swarm.behaviour_mut().kad.add_address(&peer_id, addr_bare);
+                    // Dial-Liste behält die Original-Adresse (mit /p2p wenn vorhanden)
+                    by_peer.entry(peer_id).or_default().push(addr);
+                }
+
+                for (peer_id, addrs) in by_peer {
+                    // Bereits verbunden (laut Swarm-State) → kein erneuter Dial
+                    if self.swarm.is_connected(&peer_id) {
+                        continue;
+                    }
+                    // Bereits verbunden (laut unserer Peer-Map) → überspringen
+                    if self.peers.get(&peer_id).map(|p| p.connected).unwrap_or(false) {
+                        continue;
+                    }
+
+                    // Bevorzuge LAN-Adressen (10.x / 192.168.x / 172.x)
+                    fn is_lan(addr: &libp2p::Multiaddr) -> bool {
+                        use libp2p::multiaddr::Protocol;
+                        addr.iter().any(|p| matches!(p, Protocol::Ip4(ip) if ip.is_private() && !ip.is_loopback()))
+                    }
+
+                    // Adressen sortieren: LAN-Adressen zuerst, dann Rest
+                    let mut sorted_addrs = addrs.clone();
+                    sorted_addrs.sort_by_key(|a| if is_lan(a) { 0u8 } else { 1u8 });
+
+                    // Beste Adresse für das Log
+                    let best_addr = sorted_addrs.first().cloned();
+
+                    // DialOpts mit allen Adressen + NotDialing-Condition:
+                    // - libp2p dedupliziert selbst (kein zweiter Dial wenn bereits pending)
+                    // - strip_p2p_suffix: Kademlia braucht Adressen ohne /p2p-Suffix,
+                    //   aber swarm.dial() braucht die vollständige Adresse MIT /p2p-Suffix
+                    //   damit libp2p die PeerId verifizieren kann.
+                    use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
+                    let opts = DialOpts::peer_id(peer_id)
+                        .addresses(sorted_addrs)
+                        .condition(PeerCondition::NotDialing)
+                        .build();
+
+                    match self.swarm.dial(opts) {
+                        Ok(_) => {
+                            if let Some(a) = best_addr {
+                                println!("[p2p] mDNS-Dial → {a}");
+                            }
+                        }
+                        Err(e) => {
+                            let s = e.to_string();
+                            // Alle bekannten Race-Conditions stumm schalten
+                            if !s.contains("condition")
+                                && !s.contains("Already")
+                                && !s.contains("connected")
+                                && !s.contains("Pending")
+                            {
+                                eprintln!("[p2p] mDNS-Dial {peer_id}: {e}");
+                            }
+                        }
                     }
                 }
             }

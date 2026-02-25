@@ -183,13 +183,43 @@ impl StoneChain {
         std::fs::create_dir_all(data_dir()).unwrap_or(());
         std::fs::create_dir_all(chunk_dir()).unwrap_or(());
 
+        // Erwarteter Genesis-Hash für diesen cluster_key (deterministisch)
+        let expected_genesis = genesis_block(cluster_key);
+
         match ChainStore::open() {
             Ok(store) if !store.is_empty() => {
                 match store.read_all_blocks() {
                     Ok(blocks) if !blocks.is_empty() => {
-                        let latest_hash = blocks.last().map(|b| b.hash.clone()).unwrap_or_default();
-                        println!("[chain] RocksDB geladen: {} Blöcke, Latest: {}...", blocks.len(), &latest_hash[..8]);
-                        return StoneChain { blocks, latest_hash };
+                        let stored_genesis_hash = blocks[0].hash.clone();
+
+                        // Genesis-Hash Validierung: stimmt die DB mit dem aktuellen
+                        // cluster_key überein?
+                        if stored_genesis_hash != expected_genesis.hash {
+                            eprintln!(
+                                "[chain] ⚠️  Genesis-Mismatch in lokaler DB! \
+                                 Gespeichert: {}... | Erwartet: {}...",
+                                &stored_genesis_hash[..8],
+                                &expected_genesis.hash[..8]
+                            );
+                            eprintln!(
+                                "[chain] DB stammt von einem anderen Cluster-Key. \
+                                 Starte mit frischer Chain."
+                            );
+                            // DB zurücksetzen und neue Chain anlegen
+                            drop(store);
+                            let db_path = format!("{}/chain_db", data_dir());
+                            if let Err(e) = std::fs::remove_dir_all(&db_path) {
+                                eprintln!("[chain] DB-Reset fehlgeschlagen: {e}");
+                            }
+                        } else {
+                            let latest_hash = blocks.last().map(|b| b.hash.clone()).unwrap_or_default();
+                            println!(
+                                "[chain] RocksDB geladen: {} Blöcke, Latest: {}...",
+                                blocks.len(),
+                                &latest_hash[..8]
+                            );
+                            return StoneChain { blocks, latest_hash };
+                        }
                     }
                     _ => {}
                 }
@@ -198,7 +228,7 @@ impl StoneChain {
         }
 
         // Leere oder neue Datenbank → Genesis-Block erstellen
-        let genesis = genesis_block(cluster_key);
+        let genesis = expected_genesis;
         let chain = StoneChain {
             blocks: vec![genesis.clone()],
             latest_hash: genesis.hash.clone(),
