@@ -21,8 +21,9 @@
 //!   POST   /api/v1/peers                     – Peer hinzufügen
 //!   DELETE /api/v1/peers/:idx                – Peer entfernen
 //!   POST   /api/v1/sync                      – Manuelle Synchronisation
-//!   POST   /api/v1/auth/signup               – Neuen Nutzer anlegen
+//!   POST   /api/v1/auth/signup               – Neuen Nutzer anlegen (pusht an Peers)
 //!   POST   /api/v1/auth/login                – Phrase-Login
+//!   POST   /api/v1/admin/sync-users          – Nutzer-Liste von Peer empfangen & mergen
 //!   GET    /api/v1/chain/verify              – Chain-Integrität prüfen
 //!   GET    /ws                               – WebSocket Event-Stream
 
@@ -1997,24 +1998,108 @@ async fn handle_signup(
             axum::Json(json!({"error": "Name darf nicht leer sein"})),
         );
     }
-    let mut users = state.users.lock().unwrap();
-    let id = format!("user-{}", users.len() + 1);
-    let (mut user, phrase) = create_user_with_phrase(req.name.trim());
-    user.id = id.clone();
-    users.push(user.clone());
-    save_users(&users);
+    let (id, new_user, phrase) = {
+        let mut users = state.users.lock().unwrap();
+        let id = format!("user-{}", users.len() + 1);
+        let (mut user, phrase) = create_user_with_phrase(req.name.trim());
+        user.id = id.clone();
+        users.push(user.clone());
+        save_users(&users);
+        (id, user, phrase)
+    };
+
+    // Neuen Nutzer asynchron an alle bekannten Peers pushen
+    let peers = state.node.get_peers();
+    let api_key = state.api_key.clone();
+    let push_user = new_user.clone();
+    tokio::spawn(async move {
+        push_user_to_peers(&push_user, &peers, &api_key).await;
+    });
 
     (
         StatusCode::CREATED,
         axum::Json(json!({
             "id": id,
-            "name": user.name,
-            "api_key": user.api_key,
+            "name": new_user.name,
+            "api_key": new_user.api_key,
             "phrase": phrase,
             "message": "Bitte die Phrase sicher aufbewahren – sie wird nur einmal angezeigt.",
         })),
     )
 }
+
+/// POST /api/v1/admin/sync-users  (Admin-Key erforderlich)
+/// Empfängt eine Liste von Nutzern und merged sie in die lokale users.json.
+/// Bestehende Nutzer (gleiche ID) werden nur aktualisiert wenn der Eintrag
+/// sich geändert hat. Neue Nutzer werden hinzugefügt.
+async fn handle_sync_users(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(incoming): axum::Json<Vec<User>>,
+) -> impl IntoResponse {
+    if let Err(e) = require_admin(&headers, &state) {
+        return e;
+    }
+    let mut users = state.users.lock().unwrap();
+    let mut added = 0usize;
+    let mut updated = 0usize;
+    for inc in &incoming {
+        if let Some(existing) = users.iter_mut().find(|u| u.id == inc.id) {
+            if existing.api_key != inc.api_key || existing.name != inc.name {
+                *existing = inc.clone();
+                updated += 1;
+            }
+        } else {
+            users.push(inc.clone());
+            added += 1;
+        }
+    }
+    if added > 0 || updated > 0 {
+        save_users(&users);
+    }
+    (
+        StatusCode::OK,
+        axum::Json(json!({ "ok": true, "added": added, "updated": updated })),
+    )
+    .into_response()
+}
+
+/// Pusht einen einzelnen Nutzer an alle bekannten HTTP-Peers.
+async fn push_user_to_peers(user: &User, peers: &[PeerInfo], api_key: &str) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .danger_accept_invalid_certs(
+            std::env::var("STONE_INSECURE_SSL")
+                .map(|v| v == "1")
+                .unwrap_or(false),
+        )
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    for peer in peers {
+        let url = format!("{}/api/v1/admin/sync-users", peer.url.trim_end_matches('/'));
+        match client
+            .post(&url)
+            .header("x-api-key", api_key)
+            .json(&vec![user])
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                println!("[auth] Nutzer '{}' an Peer {} gepusht", user.name, peer.url);
+            }
+            Ok(r) => {
+                eprintln!("[auth] Peer {} sync-users: HTTP {}", peer.url, r.status());
+            }
+            Err(e) => {
+                eprintln!("[auth] Peer {} nicht erreichbar: {e}", peer.url);
+            }
+        }
+    }
+}
+
 
 /// POST /api/v1/auth/login
 async fn handle_login(
@@ -2211,7 +2296,7 @@ async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key: &s
         }
     };
 
-    let blocks: Vec<stone::blockchain::Block> = match val
+    let mut blocks: Vec<stone::blockchain::Block> = match val
         .get("blocks")
         .and_then(|b| serde_json::from_value(b.clone()).ok())
     {
@@ -2222,6 +2307,9 @@ async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key: &s
             return;
         }
     };
+
+    // Aufsteigend nach Index sortieren (API gibt u.U. absteigend zurück)
+    blocks.sort_by_key(|b| b.index);
 
     let mut added = 0u64;
 
@@ -2411,7 +2499,7 @@ async fn fetch_missing_chunks(block: &stone::blockchain::Block, peer_base_url: &
     }
 }
 
-fn spawn_auto_sync_task(node: Arc<MasterNodeState>, api_key: Arc<String>) {
+fn spawn_auto_sync_task(node: Arc<MasterNodeState>, api_key: Arc<String>, users: Arc<Mutex<Vec<User>>>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(AUTO_SYNC_INTERVAL);
         loop {
@@ -2419,9 +2507,59 @@ fn spawn_auto_sync_task(node: Arc<MasterNodeState>, api_key: Arc<String>) {
             let peers = node.get_peers();
             for peer in peers {
                 pull_from_peer(&node, &peer.url, &api_key).await;
+                pull_users_from_peer(&peer.url, &api_key, &users).await;
             }
         }
     });
+}
+
+/// Holt die Nutzerliste von einem Peer und merged sie lokal.
+async fn pull_users_from_peer(peer_url: &str, api_key: &str, users: &Arc<Mutex<Vec<User>>>) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .danger_accept_invalid_certs(
+            std::env::var("STONE_INSECURE_SSL")
+                .map(|v| v == "1")
+                .unwrap_or(false),
+        )
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let url = format!("{}/api/v1/users", peer_url.trim_end_matches('/'));
+    let resp = match client
+        .get(&url)
+        .header("x-api-key", api_key)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+
+    if !resp.status().is_success() {
+        return;
+    }
+
+    let remote_users: Vec<User> = match resp.json().await {
+        Ok(u) => u,
+        Err(_) => return,
+    };
+
+    let mut local = users.lock().unwrap();
+    let mut added = 0usize;
+    for ru in &remote_users {
+        if !local.iter().any(|u| u.id == ru.id) {
+            local.push(ru.clone());
+            added += 1;
+        }
+    }
+    if added > 0 {
+        save_users(&local);
+        println!("[sync] {added} neue Nutzer von {peer_url} übernommen");
+    }
 }
 
 // ─── CORS-Konfiguration ───────────────────────────────────────────────────────
@@ -2657,6 +2795,8 @@ fn build_router(state: AppState) -> Router {
         // Auth
         .route("/api/v1/auth/signup", post(handle_signup))
         .route("/api/v1/auth/login", post(handle_login))
+        // Admin: User-Sync zwischen Nodes
+        .route("/api/v1/admin/sync-users", post(handle_sync_users))
         // PoA: Validators
         .route("/api/v1/validators",          get(handle_list_validators).post(handle_add_validator))
         .route("/api/v1/validators/self",     get(handle_validator_self))
@@ -2720,7 +2860,7 @@ async fn main() {
 
     // Hintergrund-Tasks starten
     MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
-    spawn_auto_sync_task(node.clone(), api_key.clone());
+    spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone());
 
     // P2P-Netzwerk starten (optional – deaktivieren via STONE_P2P_DISABLED=1)
     let network_handle = if std::env::var("STONE_P2P_DISABLED").as_deref() == Ok("1") {
