@@ -147,7 +147,7 @@ def main() -> int:
         err(f".env nicht gefunden: {env_path}")
         info("Erstelle eine .env Datei. Vorlage:")
         print(f"""
-{YELLOW}  NOMAD_URL=https://dein-forge-nomad-server.de
+{YELLOW}  NOMAD_URL=http://127.0.0.1:5002{RESET}
   NODE_SECRET=dein-geheimes-passwort
   STONE_HTTP_PORT=8080
   STONE_P2P_PORT=7654

@@ -5,6 +5,44 @@ use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 
+// ─── bincode-kompatibles serde_json::Value Wrapper ───────────────────────────
+//
+// bincode v2 unterstützt kein serde_json::Value direkt (AnyNotSupported-Fehler).
+// Lösung: Value wird als JSON-String in RocksDB gespeichert und beim Lesen
+// wieder deserialisiert. Für alle anderen Formate (JSON API) ist es transparent.
+
+#[derive(Debug, Clone, Default)]
+pub struct JsonValue(pub serde_json::Value);
+
+impl Serialize for JsonValue {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if s.is_human_readable() {
+            // JSON-API: Value direkt serialisieren
+            self.0.serialize(s)
+        } else {
+            // bincode: als JSON-String serialisieren
+            let json_str = serde_json::to_string(&self.0)
+                .map_err(serde::ser::Error::custom)?;
+            s.serialize_str(&json_str)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for JsonValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        if d.is_human_readable() {
+            // JSON-API: Value direkt deserialisieren
+            Ok(JsonValue(serde_json::Value::deserialize(d)?))
+        } else {
+            // bincode: JSON-String → Value parsen
+            let s = String::deserialize(d)?;
+            let val = serde_json::from_str(&s)
+                .unwrap_or(serde_json::Value::Null);
+            Ok(JsonValue(val))
+        }
+    }
+}
+
 /// Datenverzeichnis – überschreibbar per `STONE_DATA_DIR` env var.
 /// Verwendet von: token, RocksDB, chunks, users, peers.
 pub fn data_dir() -> String {
@@ -45,7 +83,7 @@ pub struct Document {
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
-    pub metadata: serde_json::Value,
+    pub metadata: JsonValue,
     #[serde(default = "default_version")]
     pub version: u32,
     pub size: u64,
@@ -238,7 +276,7 @@ impl StoneChain {
         chain
     }
 
-    /// Persistiert den letzten Block in RocksDB.
+    /// Persistiert den letzten Block in RocksDB (mit WAL-Sync).
     ///
     /// Wird nach `add_documents()` automatisch aufgerufen.
     pub fn persist_last_block(&self) {
@@ -246,7 +284,7 @@ impl StoneChain {
         if let Some(block) = self.blocks.last() {
             match ChainStore::open() {
                 Ok(store) => {
-                    if let Err(e) = store.write_block(block) {
+                    if let Err(e) = store.write_block_sync(block) {
                         eprintln!("[chain] RocksDB-Schreibfehler: {e}");
                     }
                 }
@@ -261,7 +299,7 @@ impl StoneChain {
         match ChainStore::open() {
             Ok(store) => {
                 for block in &self.blocks {
-                    if let Err(e) = store.write_block(block) {
+                    if let Err(e) = store.write_block_sync(block) {
                         eprintln!("[chain] Fehler beim Schreiben von Block #{}: {e}", block.index);
                     }
                 }

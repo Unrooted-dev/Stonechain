@@ -14,6 +14,10 @@ path = "src/bin/master_server.rs"
 name = "stone-auth"
 path = "src/bin/auth_server.rs"
 
+[[bin]]
+name = "db-dump"
+path = "src/bin/db_dump.rs"
+
 # ─── Abhängigkeiten ───────────────────────────────────────────────────────────
 [dependencies]
 # Serialisierung

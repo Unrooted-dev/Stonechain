@@ -986,7 +986,7 @@ async fn handle_upload_document(
         title: title.clone(),
         content_type,
         tags,
-        metadata,
+        metadata: stone::blockchain::JsonValue(metadata),
         version,
         size: file_bytes.len() as u64,
         chunks,
@@ -1133,7 +1133,9 @@ async fn handle_patch_document(
         Document {
             title: req.title.unwrap_or_else(|| doc.title.clone()),
             tags: req.tags.unwrap_or_else(|| doc.tags.clone()),
-            metadata: req.metadata.unwrap_or_else(|| doc.metadata.clone()),
+            metadata: stone::blockchain::JsonValue(
+                req.metadata.unwrap_or_else(|| doc.metadata.0.clone()),
+            ),
             content_type: req.content_type.unwrap_or_else(|| doc.content_type.clone()),
             version: doc.version + 1,
             updated_at: chrono::Utc::now().timestamp(),
@@ -1390,7 +1392,7 @@ async fn handle_search_documents(
             if !query_text.is_empty() {
                 let title_match = d.title.to_lowercase().contains(&query_text);
                 let tag_match = d.tags.iter().any(|t| t.to_lowercase().contains(&query_text));
-                let meta_match = d.metadata.to_string().to_lowercase().contains(&query_text);
+                let meta_match = d.metadata.0.to_string().to_lowercase().contains(&query_text);
                 if !title_match && !tag_match && !meta_match {
                     return false;
                 }
@@ -2822,7 +2824,8 @@ async fn main() {
     // TLS-Konfiguration
     let use_tls = std::env::var("STONE_TLS_CERT").is_ok()
         && std::env::var("STONE_TLS_KEY").is_ok();
-    let preferred_port: u16 = std::env::var("STONE_PORT")
+    let preferred_port: u16 = std::env::var("STONE_HTTP_PORT")
+        .or_else(|_| std::env::var("STONE_PORT"))
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(if use_tls { 443 } else { 8080 });
@@ -2845,32 +2848,30 @@ async fn main() {
         .await
         .expect("HTTPS-Server Fehler");
     } else {
-        // Port-Fallback: falls bevorzugter Port belegt → nächsten freien suchen
+        // Port-Fallback: falls bevorzugter Port belegt → Fehler mit Hinweis (kein zufälliger Port)
         let listener = bind_with_fallback(preferred_port).await;
         let bound_port = listener.local_addr().unwrap().port();
         println!("[master] HTTP auf 0.0.0.0:{bound_port} (kein TLS – nur für Entwicklung!)");
         println!("[master] Stone Master Node läuft auf http://0.0.0.0:{bound_port}");
         println!("[master] Web-UI kann sich via ws://0.0.0.0:{bound_port}/ws verbinden");
-        if bound_port != preferred_port {
-            println!("[master] ⚠️  Port {preferred_port} war belegt – nutze {bound_port}");
-            println!("[master] Tipp: STONE_PORT={bound_port} setzen um diesen Port fest zu konfigurieren");
-        }
         println!("[master] Hinweis: Für Produktion STONE_TLS_CERT und STONE_TLS_KEY setzen.");
         axum::serve(listener, router).await.expect("HTTP-Server Fehler");
     }
 }
 
-/// Bindet an `preferred_port`, fällt automatisch auf einen freien Port zurück.
+/// Bindet an `preferred_port`. Bei Port-Konflikt: harter Fehler statt zufälligem Port.
+/// Zufällige Ports brechen Flask-Proxy, Dashboard und Peer-Sync.
 async fn bind_with_fallback(preferred_port: u16) -> tokio::net::TcpListener {
     let addr = SocketAddr::from(([0, 0, 0, 0], preferred_port));
     match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            eprintln!("[master] Port {preferred_port} belegt ({e}) – suche freien Port...");
-            let fallback = SocketAddr::from(([0, 0, 0, 0], 0));
-            tokio::net::TcpListener::bind(fallback)
-                .await
-                .expect("Kein freier TCP-Port verfügbar")
+            eprintln!("[master] ❌ Port {preferred_port} ist bereits belegt!");
+            eprintln!("[master] Lösungen:");
+            eprintln!("[master]   1) Alte Prozesse beenden:  pkill -f stone-master");
+            eprintln!("[master]   2) Anderen Port nutzen:    STONE_HTTP_PORT={} cargo run --bin stone-master", preferred_port + 1);
+            eprintln!("[master]   3) Belegenden Prozess prüfen: lsof -i :{preferred_port}");
+            std::process::exit(1);
         }
         Err(e) => panic!("TCP-Bind fehlgeschlagen: {e}"),
     }

@@ -26,7 +26,7 @@
 
 use crate::blockchain::{Block, Document, chunk_dir, data_dir};
 use bincode::config::standard;
-use rocksdb::{ColumnFamilyDescriptor, DB, Options, WriteBatch};
+use rocksdb::{ColumnFamilyDescriptor, DB, Options, WriteBatch, WriteOptions};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -142,6 +142,43 @@ impl ChainStore {
         }
 
         self.db.write(batch)?;
+        Ok(())
+    }
+
+    /// Schreibt einen Block mit sofortigem WAL-Sync (für kritische Persistenz).
+    ///
+    /// Identisch zu `write_block`, aber mit `sync = true` in den WriteOptions,
+    /// damit der Block nach dem Aufruf garantiert auf Disk ist.
+    pub fn write_block_sync(&self, block: &Block) -> Result<(), StorageError> {
+        let cf_blocks = self.db.cf_handle("blocks")
+            .ok_or_else(|| StorageError::NotFound("CF 'blocks' nicht gefunden".into()))?;
+        let cf_meta = self.db.cf_handle("meta")
+            .ok_or_else(|| StorageError::NotFound("CF 'meta' nicht gefunden".into()))?;
+        let cf_index = self.db.cf_handle("index")
+            .ok_or_else(|| StorageError::NotFound("CF 'index' nicht gefunden".into()))?;
+
+        let encoded = bincode::serde::encode_to_vec(block, standard())
+            .map_err(|e| StorageError::Encode(e.to_string()))?;
+
+        let key_index = block.index.to_le_bytes();
+        let block_index_bytes = block.index.to_le_bytes();
+
+        let mut batch = WriteBatch::default();
+        batch.put_cf(cf_blocks, key_index, &encoded);
+        for doc in &block.documents {
+            batch.put_cf(cf_index, doc.doc_id.as_bytes(), block_index_bytes);
+        }
+        batch.put_cf(cf_meta, b"latest_hash", block.hash.as_bytes());
+        let count = (block.index + 1).to_le_bytes();
+        batch.put_cf(cf_meta, b"block_count", count);
+        if block.index == 0 {
+            batch.put_cf(cf_meta, b"genesis_hash", block.hash.as_bytes());
+        }
+
+        // WAL sofort auf Disk flushen → überlebt Absturz / abruptes Beenden
+        let mut wo = WriteOptions::default();
+        wo.set_sync(true);
+        self.db.write_opt(batch, &wo)?;
         Ok(())
     }
 
@@ -509,6 +546,8 @@ mod tests {
             tombstones: Vec::new(),
             node_role: NodeRole::Master,
             proposal_round: 0,
+            validator_pub_key: String::new(),
+            validator_signature: String::new(),
         }
     }
 

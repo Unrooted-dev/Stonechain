@@ -406,10 +406,10 @@ impl MasterNodeState {
                 block.validator_pub_key = pub_key_hex;
                 block.validator_signature = sig;
 
-                // Signierter Block in RocksDB aktualisieren
+                // Signierter Block in RocksDB aktualisieren (mit WAL-Sync)
                 use crate::storage::ChainStore;
                 if let Ok(store) = ChainStore::open() {
-                    let _ = store.write_block(&block);
+                    let _ = store.write_block_sync(&block);
                 }
                 // Auch in der in-memory chain aktualisieren
                 if let Some(last) = chain.blocks.last_mut() {
@@ -661,7 +661,7 @@ impl From<&crate::blockchain::Document> for DocumentResponse {
             title: d.title.clone(),
             content_type: d.content_type.clone(),
             tags: d.tags.clone(),
-            metadata: d.metadata.clone(),
+            metadata: d.metadata.0.clone(),
             version: d.version,
             size: d.size,
             owner: d.owner.clone(),

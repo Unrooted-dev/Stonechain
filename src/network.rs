@@ -1119,6 +1119,31 @@ impl SwarmTask {
                     .map(|p| p.to_string())
                     .collect();
 
+                // Direkt aus dem Swarm die verbundenen Peers holen —
+                // das ist die einzig zuverlässige Quelle, unabhängig von peers-Map.
+                let swarm_connected: HashSet<String> = self.swarm
+                    .connected_peers()
+                    .map(|p| p.to_string())
+                    .collect();
+
+                // peers-Map mit Swarm-Status synchronisieren
+                for (peer_id, info) in self.peers.iter_mut() {
+                    info.connected = swarm_connected.contains(&peer_id.to_string());
+                }
+                // Peers die im Swarm verbunden sind aber noch nicht in unserer Map
+                for peer_str in &swarm_connected {
+                    if let Ok(peer_id) = peer_str.parse::<libp2p::PeerId>() {
+                        self.peers.entry(peer_id).or_insert_with(|| PeerInfo {
+                            peer_id: peer_str.clone(),
+                            addresses: vec![],
+                            agent_version: String::new(),
+                            connected: true,
+                            last_seen: now,
+                            blocks_received: 0,
+                        });
+                    }
+                }
+
                 let peers: Vec<PeerStatus> = self.peers.values().map(|p| PeerStatus {
                     peer_id: p.peer_id.clone(),
                     addresses: p.addresses.clone(),
@@ -1130,7 +1155,7 @@ impl SwarmTask {
                     in_gossipsub_mesh: mesh_peers.contains(&p.peer_id),
                 }).collect();
 
-                let connected = peers.iter().filter(|p| p.connected).count();
+                let connected = swarm_connected.len(); // direkt aus Swarm
                 let _ = reply.send(NetworkStatus {
                     local_peer_id: self.swarm.local_peer_id().to_string(),
                     connected_peers: connected,
