@@ -99,7 +99,17 @@ pub async fn handle_network_stats(
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            std::process::Command::new("ps")
+                .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(0)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         { 0 }
     };
 
@@ -114,7 +124,7 @@ pub async fn handle_network_stats(
                 .map(|(_, v)| v.parse::<u64>().unwrap_or(0))
                 .sum::<u64>() * 10
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux")))]
         { 0 }
     };
 
@@ -139,6 +149,10 @@ pub async fn handle_network_stats(
     };
 
     let m = state.node.snapshot_metrics();
+    let block_count = {
+        let chain = state.node.chain.lock().unwrap();
+        chain.blocks.len() as u64
+    };
 
     Ok((StatusCode::OK, axum::Json(json!({
         "p2p": {
@@ -157,7 +171,7 @@ pub async fn handle_network_stats(
             "data_dir_bytes":   data_dir_bytes,
         },
         "chain": {
-            "blocks":           m.peers_total,
+            "blocks":           block_count,
             "requests_total":   m.requests_total,
             "sync_runs":        m.sync_runs,
             "sync_success":     m.sync_success,
