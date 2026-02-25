@@ -371,16 +371,28 @@ impl StoneChain {
         block: Block,
         poa_ok: Option<bool>,
     ) -> Result<(), String> {
-        let expected_index = self.blocks.len() as u64;
-        if block.index != expected_index {
+        let local_len = self.blocks.len() as u64;
+
+        // Block ist älter als unsere Chain → stillschweigend ignorieren
+        if block.index < local_len {
             return Err(format!(
-                "Index-Mismatch: erwartet {expected_index}, empfangen {}",
+                "Stale: Block #{} bereits bekannt (lokale Höhe: {local_len})",
                 block.index
             ));
         }
+
+        // Block für einen Index den wir noch nicht haben, aber nicht der nächste →
+        // Lücke in der Chain → vollständiger Resync vom Peer nötig
+        if block.index != local_len {
+            return Err(format!(
+                "Gap: erwarte Index {local_len}, empfangen {} – Resync erforderlich",
+                block.index
+            ));
+        }
+
         if block.previous_hash != self.latest_hash {
             return Err(format!(
-                "previous_hash passt nicht: erwartet {}, empfangen {}",
+                "previous_hash passt nicht: erwartet {}, empfangen {} – möglicher Fork",
                 &self.latest_hash[..12.min(self.latest_hash.len())],
                 &block.previous_hash[..12.min(block.previous_hash.len())],
             ));

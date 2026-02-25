@@ -2313,30 +2313,83 @@ async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key: &s
 
     let mut added = 0u64;
 
-    // Chunk-URLs sammeln BEVOR wir den Lock halten (wegen .await)
-    let (_local_len, _local_gen_hash, pending_blocks) = {
-        let chain = node.chain.lock().unwrap();
+    // Hash-Integrität aller Peer-Blöcke prüfen
+    let blocks: Vec<_> = blocks
+        .into_iter()
+        .filter(|b| stone::blockchain::calculate_hash(b) == b.hash)
+        .collect();
+
+    // Lokale Chain-Info + Fork-Erkennung + Rollback falls nötig
+    let (pending_blocks, did_rollback) = {
+        let mut chain = node.chain.lock().unwrap();
         let local_len = chain.blocks.len() as u64;
         let local_gen_hash = chain.blocks.first().map(|b| b.hash.clone()).unwrap_or_default();
 
-        // Genesis prüfen
+        // Genesis-Mismatch: komplett inkompatible Chains
         if let Some(peer_gen) = blocks.first() {
             if !local_gen_hash.is_empty() && local_gen_hash != peer_gen.hash {
-                eprintln!("[sync] {peer_url}: Genesis-Mismatch");
+                eprintln!("[sync] {peer_url}: Genesis-Mismatch – inkompatibler Peer");
                 node.metrics.sync_failure.fetch_add(1, Ordering::Relaxed);
                 return;
             }
         }
 
-        // Neue Blöcke filtern und Hash prüfen
+        // Fork-Erkennung: Suche den ersten Block wo unsere Chain vom Peer abweicht
+        let mut fork_at: Option<usize> = None;
+        for peer_block in &blocks {
+            let idx = peer_block.index as usize;
+            if idx < chain.blocks.len() {
+                if chain.blocks[idx].hash != peer_block.hash {
+                    // Peer hat anderen Block an dieser Stelle → Fork
+                    fork_at = Some(idx);
+                    break;
+                }
+            }
+        }
+
+        let did_rollback = if let Some(fork_idx) = fork_at {
+            let peer_len = blocks.len() as u64;
+            // Peer-Chain länger oder gleich lang → Peer-Kette übernehmen (longest-chain rule)
+            if peer_len >= local_len {
+                eprintln!(
+                    "[sync] {peer_url}: Fork bei Index {fork_idx} erkannt – \
+                     Peer-Chain ({peer_len} Blöcke) >= lokal ({local_len}) → Rollback & Übernahme"
+                );
+                // Rollback: alle Blöcke ab fork_idx verwerfen
+                chain.blocks.truncate(fork_idx);
+                chain.latest_hash = chain
+                    .blocks
+                    .last()
+                    .map(|b| b.hash.clone())
+                    .unwrap_or_default();
+                // Persistenz aktualisieren
+                chain.persist_all();
+                true
+            } else {
+                // Unsere Chain ist länger → Peer hat weniger Daten, wir behalten unsere Version
+                eprintln!(
+                    "[sync] {peer_url}: Fork bei Index {fork_idx} – \
+                     unsere Chain ({local_len}) > Peer ({peer_len}) → behalte lokale Chain"
+                );
+                false
+            }
+        } else {
+            false
+        };
+
+        // Neue Blöcke (die nach dem letzten gemeinsamen Punkt kommen)
+        let cur_len = chain.blocks.len() as u64;
         let pending: Vec<stone::blockchain::Block> = blocks
             .into_iter()
-            .filter(|b| b.index >= local_len)
-            .filter(|b| stone::blockchain::calculate_hash(b) == b.hash)
+            .filter(|b| b.index >= cur_len)
             .collect();
 
-        (local_len, local_gen_hash, pending)
+        (pending, did_rollback)
     };
+
+    if did_rollback {
+        eprintln!("[sync] {peer_url}: Rollback abgeschlossen, übernehme {} neue Blöcke", pending_blocks.len());
+    }
 
     // Chunks laden (async, ohne Mutex)
     let chunk_store = ChunkStore::new().unwrap_or_default();
@@ -2348,15 +2401,20 @@ async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key: &s
                 }
                 let chunk_url =
                     format!("{}/api/v1/chunk/{}", peer_url.trim_end_matches('/'), ch.hash);
-                if let Ok(r) = client
+                match client
                     .get(&chunk_url)
                     .header("x-api-key", api_key)
                     .send()
                     .await
                 {
-                    if let Ok(bytes) = r.bytes().await {
-                        let _ = chunk_store.write_chunk(&bytes);
+                    Ok(r) if r.status().is_success() => {
+                        if let Ok(bytes) = r.bytes().await {
+                            let _ = chunk_store.write_chunk(&bytes);
+                            println!("[sync] ✓ Chunk {} von {peer_url} geholt", &ch.hash[..8]);
+                        }
                     }
+                    Ok(r) => eprintln!("[sync] Chunk {} – HTTP {}", &ch.hash[..8], r.status()),
+                    Err(e) => eprintln!("[sync] Chunk {} – Fehler: {e}", &ch.hash[..8]),
                 }
             }
         }
@@ -2916,7 +2974,7 @@ async fn main() {
                                     };
 
                                     let mut chain = node_bg.chain.lock().unwrap();
-                                    // Duplikat-Prüfung: Block bereits in der Chain?
+                                    // Duplikat-Prüfung: Block bereits in der Chain (gleicher Hash)?
                                     let already_known = chain.blocks.iter().any(|b| b.hash == block.hash);
                                     if !already_known {
                                         let idx = block.index;
@@ -2924,6 +2982,22 @@ async fn main() {
                                             Ok(_) => {
                                                 println!("[p2p] ✓ Block #{idx} von {from_peer} in Chain aufgenommen");
                                                 Some(chain.blocks.len() as u64)
+                                            }
+                                            Err(ref e) if e.starts_with("Stale:") => {
+                                                // Alter Block – normal nach Resync, kein Handlungsbedarf
+                                                None
+                                            }
+                                            Err(ref e) if e.starts_with("Gap:") || e.contains("previous_hash") => {
+                                                // Lücke oder Fork: HTTP-Resync mit dem Peer auslösen
+                                                eprintln!("[p2p] Block #{idx} von {from_peer}: {e} → starte HTTP-Resync");
+                                                drop(chain); // Lock freigeben bevor await
+                                                let node_r = node_bg.clone();
+                                                let url_r = from_peer.clone();
+                                                let key_r = api_key_bg.clone();
+                                                tokio::spawn(async move {
+                                                    pull_from_peer(&node_r, &url_r, &key_r).await;
+                                                });
+                                                None
                                             }
                                             Err(e) => {
                                                 eprintln!("[p2p] Block #{idx} abgelehnt: {e}");
