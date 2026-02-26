@@ -316,6 +316,10 @@ pub struct MasterNodeState {
     pub metrics: MasterMetrics,
     /// Zeitpunkt des Starts
     pub started_at: i64,
+    /// Web-of-Trust Registry
+    pub trust_registry: RwLock<Vec<TrustEntry>>,
+    /// Abstimmungshistorie (Audit-Log)
+    pub trust_history: Mutex<Vec<TrustVote>>,
 }
 
 #[derive(Default)]
@@ -346,6 +350,8 @@ impl MasterNodeState {
             events: EventBus::new(256),
             metrics: MasterMetrics::default(),
             started_at,
+            trust_registry: RwLock::new(Vec::new()),
+            trust_history: Mutex::new(Vec::new()),
         });
 
         // Node-gestartet Event senden
@@ -545,6 +551,116 @@ impl MasterNodeState {
             }
         });
     }
+
+    // ─── Web-of-Trust Methoden ────────────────────────────────────────────────
+
+    /// Join-Anfrage eintragen (falls peer_id noch nicht bekannt)
+    pub fn trust_request(
+        &self,
+        peer_id: String,
+        public_key_hex: String,
+        name: Option<String>,
+    ) -> Result<(), String> {
+        let mut reg = self.trust_registry.write().unwrap();
+        if reg.iter().any(|e| e.peer_id == peer_id) {
+            return Err(format!("peer_id '{peer_id}' bereits in der Trust-Registry"));
+        }
+        reg.push(TrustEntry::new(peer_id, public_key_hex, name));
+        Ok(())
+    }
+
+    /// Abstimmung: approve=true → Zustimmung, false → Ablehnung
+    /// Gibt (neue_status, quorum_erreicht) zurück.
+    pub fn trust_vote(
+        &self,
+        voter_peer_id: &str,
+        target_peer_id: &str,
+        approve: bool,
+    ) -> Result<TrustStatus, String> {
+        // Abstimmung ins History-Log schreiben
+        {
+            let mut history = self.trust_history.lock().unwrap();
+            history.push(TrustVote {
+                voter_peer_id: voter_peer_id.to_string(),
+                target_peer_id: target_peer_id.to_string(),
+                approve,
+                timestamp: Utc::now().timestamp(),
+            });
+        }
+
+        let mut reg = self.trust_registry.write().unwrap();
+        let entry = reg
+            .iter_mut()
+            .find(|e| e.peer_id == target_peer_id)
+            .ok_or_else(|| format!("peer_id '{target_peer_id}' nicht gefunden"))?;
+
+        if entry.status == TrustStatus::Active && approve {
+            // bereits aktiv – keine Änderung nötig
+            return Ok(TrustStatus::Active);
+        }
+
+        // Doppelabstimmung desselben Voters verhindern
+        entry.votes_approve.retain(|v| v != voter_peer_id);
+        entry.votes_reject.retain(|v| v != voter_peer_id);
+
+        if approve {
+            entry.votes_approve.push(voter_peer_id.to_string());
+        } else {
+            entry.votes_reject.push(voter_peer_id.to_string());
+        }
+
+        // Quorum: Anzahl aktiver Validators als Referenz (min 1)
+        let active_validators = {
+            let vs = self.validator_set.read().unwrap();
+            vs.validators.iter().filter(|v| v.active).count().max(1)
+        };
+        let threshold = (active_validators / 2) + 1;
+
+        if entry.votes_approve.len() >= threshold {
+            entry.status = TrustStatus::Active;
+            entry.decided_at = Some(Utc::now().timestamp());
+        } else if entry.votes_reject.len() >= threshold {
+            entry.status = TrustStatus::Revoked;
+            entry.decided_at = Some(Utc::now().timestamp());
+        }
+
+        Ok(entry.status.clone())
+    }
+
+    /// Zusammenfassung für NodeStatusResponse
+    pub fn trust_summary(&self) -> TrustSummary {
+        let reg = self.trust_registry.read().unwrap();
+        TrustSummary {
+            active: reg.iter().filter(|e| e.status == TrustStatus::Active).count(),
+            pending: reg.iter().filter(|e| e.status == TrustStatus::Pending).count(),
+            revoked: reg.iter().filter(|e| e.status == TrustStatus::Revoked).count(),
+        }
+    }
+
+    /// Gibt alle Pending-Einträge zurück
+    pub fn trust_pending(&self) -> Vec<TrustEntry> {
+        self.trust_registry
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|e| e.status == TrustStatus::Pending)
+            .cloned()
+            .collect()
+    }
+
+    /// Gibt die Abstimmungshistorie zurück
+    pub fn trust_history_snapshot(&self) -> Vec<TrustVote> {
+        self.trust_history.lock().unwrap().clone()
+    }
+
+    /// Prüft ob eine peer_id aktiv vertrauenswürdig ist
+    pub fn is_trusted(&self, peer_id: &str) -> bool {
+        self.trust_registry
+            .read()
+            .unwrap()
+            .iter()
+            .any(|e| e.peer_id == peer_id && e.status == TrustStatus::Active)
+    }
 }
 
 // ─── API-Typen ───────────────────────────────────────────────────────────────
@@ -680,4 +796,72 @@ pub struct NodeStatusResponse {
     pub metrics: MasterMetricsSnapshot,
     pub peers: Vec<PeerInfo>,
     pub started_at: i64,
+    pub trust: TrustSummary,
+}
+
+// ─── Web of Trust ─────────────────────────────────────────────────────────────
+
+/// Status eines Trust-Eintrags
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrustStatus {
+    /// Antrag gestellt, Abstimmung läuft
+    Pending,
+    /// Mehrheitlich akzeptiert – Node ist vertrauenswürdig
+    Active,
+    /// Widerrufen durch Abstimmung
+    Revoked,
+}
+
+/// Ein vertrauenswürdiger oder in Prüfung befindlicher Knoten
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustEntry {
+    /// libp2p PeerId oder beliebige Node-Kennung
+    pub peer_id: String,
+    /// Ed25519 öffentlicher Schlüssel (hex)
+    pub public_key_hex: String,
+    /// Optionaler Anzeigename
+    pub name: Option<String>,
+    /// Status des Eintrags
+    pub status: TrustStatus,
+    /// Zustimmungen (peer_id der Voter)
+    pub votes_approve: Vec<String>,
+    /// Ablehnungen (peer_id der Voter)
+    pub votes_reject: Vec<String>,
+    /// Zeitpunkt des Join-Requests (Unix-Timestamp)
+    pub requested_at: i64,
+    /// Zeitpunkt der Statusänderung
+    pub decided_at: Option<i64>,
+}
+
+impl TrustEntry {
+    pub fn new(peer_id: String, public_key_hex: String, name: Option<String>) -> Self {
+        Self {
+            peer_id,
+            public_key_hex,
+            name,
+            status: TrustStatus::Pending,
+            votes_approve: Vec::new(),
+            votes_reject: Vec::new(),
+            requested_at: Utc::now().timestamp(),
+            decided_at: None,
+        }
+    }
+}
+
+/// Einzelne Abstimmung (Audit-Log)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustVote {
+    pub voter_peer_id: String,
+    pub target_peer_id: String,
+    pub approve: bool,
+    pub timestamp: i64,
+}
+
+/// Kompakte Trust-Zusammenfassung für NodeStatusResponse
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustSummary {
+    pub active: usize,
+    pub pending: usize,
+    pub revoked: usize,
 }

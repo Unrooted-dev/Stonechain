@@ -42,7 +42,7 @@ use stone::{
 
 use server::{
     router::build_router,
-    state::{load_api_key, load_peers_from_disk, AppState, HEARTBEAT_INTERVAL},
+    state::{load_api_key, load_peers_from_disk, load_trust_from_disk, AppState, HEARTBEAT_INTERVAL},
     sync::{fetch_missing_chunks, pull_from_peer, spawn_auto_sync_task},
 };
 
@@ -82,6 +82,16 @@ async fn main() {
     if !saved_peers.is_empty() {
         println!("[master] {} Peer(s) aus Datei geladen", saved_peers.len());
         node.replace_peers(saved_peers);
+    }
+
+    // Trust-Registry laden
+    load_trust_from_disk(&node);
+    {
+        let summary = node.trust_summary();
+        println!(
+            "[master] Trust-Registry geladen: {} aktiv, {} pending, {} widerrufen",
+            summary.active, summary.pending, summary.revoked
+        );
     }
 
     let users = load_users();

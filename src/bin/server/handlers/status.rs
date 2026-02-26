@@ -39,6 +39,7 @@ pub async fn handle_status(
         metrics: state.node.snapshot_metrics(),
         peers: state.node.get_peers(),
         started_at: state.node.started_at,
+        trust: state.node.trust_summary(),
     };
     Ok((StatusCode::OK, axum::Json(resp)))
 }

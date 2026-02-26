@@ -8,7 +8,7 @@ use std::{
 use stone::{
     auth::User,
     blockchain::{ChunkRef, data_dir, CHUNK_SIZE, Document},
-    master_node::{MasterNodeState, PeerInfo},
+    master_node::{MasterNodeState, PeerInfo, TrustEntry, TrustVote},
     network::NetworkHandle,
     storage::ChunkStore,
 };
@@ -115,4 +115,36 @@ pub fn load_peers_from_disk() -> Vec<PeerInfo> {
         }
     }
     Vec::new()
+}
+
+// ─── Trust-Persistenz ────────────────────────────────────────────────────────
+
+pub fn trust_file() -> String {
+    format!("{}/trust.json", data_dir())
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct TrustPersist {
+    registry: Vec<TrustEntry>,
+    history: Vec<TrustVote>,
+}
+
+pub fn save_trust(state: &AppState) {
+    let _ = std::fs::create_dir_all(data_dir());
+    let data = TrustPersist {
+        registry: state.node.trust_registry.read().unwrap().clone(),
+        history: state.node.trust_history_snapshot(),
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&data) {
+        let _ = std::fs::write(trust_file(), json);
+    }
+}
+
+pub fn load_trust_from_disk(state: &MasterNodeState) {
+    if let Ok(raw) = std::fs::read_to_string(trust_file()) {
+        if let Ok(data) = serde_json::from_str::<TrustPersist>(&raw) {
+            *state.trust_registry.write().unwrap() = data.registry;
+            *state.trust_history.lock().unwrap() = data.history;
+        }
+    }
 }

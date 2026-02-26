@@ -30,6 +30,11 @@ use super::handlers::{
         handle_resolve_fork, handle_set_validator_active, handle_validator_self,
     },
     status::{handle_health, handle_metrics, handle_network_stats, handle_status, handle_verify},
+    trust::{
+        handle_trust_approve, handle_trust_check, handle_trust_history,
+        handle_trust_pending, handle_trust_registry, handle_trust_request,
+        handle_trust_revoke,
+    },
     users::{handle_delete_user, handle_list_users},
     ws::handle_websocket,
 };
@@ -128,6 +133,17 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/forks/resolve", post(handle_resolve_fork))
         // WebSocket
         .route("/ws", get(handle_websocket))
+        // ─── Web-of-Trust ────────────────────────────────────────────────────
+        // Join-Anfrage (kein Auth – neue Node meldet sich an)
+        .route("/api/v1/trust/request", post(handle_trust_request))
+        // Trust-Check (kein Auth – öffentlich abfragbar)
+        .route("/api/v1/trust/check/:peer_id", get(handle_trust_check))
+        // Admin-Endpunkte
+        .route("/api/v1/trust/pending", get(handle_trust_pending))
+        .route("/api/v1/trust/registry", get(handle_trust_registry))
+        .route("/api/v1/trust/approve/:peer_id", post(handle_trust_approve))
+        .route("/api/v1/trust/revoke/:peer_id", post(handle_trust_revoke))
+        .route("/api/v1/trust/history", get(handle_trust_history))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .layer(build_cors())
         .with_state(state)

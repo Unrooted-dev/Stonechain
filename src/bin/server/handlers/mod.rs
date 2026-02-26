@@ -8,5 +8,6 @@ pub mod p2p;
 pub mod peers;
 pub mod poa;
 pub mod status;
+pub mod trust;
 pub mod users;
 pub mod ws;
