@@ -1,5 +1,7 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
+use base64::Engine as _;
 use bip39::{Language, Mnemonic};
+use hmac::{Hmac, Mac};
 use rand::RngCore;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -99,6 +101,137 @@ pub fn resolve_phrase(phrase: &str) -> Option<String> {
         return None;
     }
     Some(hash_phrase(phrase))
+}
+
+// ─── Lokale Token-Generierung (kein Auth-Server nötig) ───────────────────────
+
+/// Claims für einen lokal generierten HMAC-Token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalTokenClaims {
+    /// Node-ID (Subject)
+    pub node_id: String,
+    /// Ausstellungszeitpunkt (Unix-Sekunden)
+    pub issued_at: u64,
+    /// Ablaufzeitpunkt (Unix-Sekunden)
+    pub expires_at: u64,
+    /// Zufälliger Nonce (verhindert Replay-Angriffe)
+    pub nonce: String,
+}
+
+impl LocalTokenClaims {
+    pub fn is_expired(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        now > self.expires_at
+    }
+}
+
+/// Erzeugt einen lokal signierten HMAC-SHA256-Token für einen Node.
+///
+/// Format: `base64(json_claims).base64(hmac_signature)`
+/// Der Token beweist, dass der Node den `cluster_key` kennt — kein
+/// zentraler Auth-Server erforderlich.
+pub fn generate_local_token(node_id: &str, cluster_key: &str, ttl_secs: u64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let mut nonce_bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+
+    let claims = LocalTokenClaims {
+        node_id: node_id.to_string(),
+        issued_at: now,
+        expires_at: now + ttl_secs,
+        nonce: hex::encode(nonce_bytes),
+    };
+
+    let claims_json = serde_json::to_string(&claims).unwrap_or_default();
+    let claims_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(claims_json.as_bytes());
+
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(cluster_key.as_bytes())
+        .expect("HMAC akzeptiert beliebige Schlüssellängen");
+    mac.update(claims_b64.as_bytes());
+    let sig = mac.finalize().into_bytes();
+    let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig);
+
+    format!("{claims_b64}.{sig_b64}")
+}
+
+/// Validiert einen lokal signierten Token.
+/// Gibt `Some(claims)` zurück wenn Signatur + Ablaufzeit gültig sind.
+pub fn validate_local_token(token: &str, cluster_key: &str) -> Option<LocalTokenClaims> {
+    let parts: Vec<&str> = token.splitn(2, '.').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let claims_b64 = parts[0];
+    let sig_b64 = parts[1];
+
+    // Signatur prüfen
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(cluster_key.as_bytes()).ok()?;
+    mac.update(claims_b64.as_bytes());
+    let expected_sig = mac.finalize().into_bytes();
+    let expected_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(expected_sig);
+    if expected_b64 != sig_b64 {
+        return None;
+    }
+
+    // Claims dekodieren
+    let claims_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(claims_b64)
+        .ok()?;
+    let claims: LocalTokenClaims = serde_json::from_slice(&claims_bytes).ok()?;
+
+    if claims.is_expired() {
+        return None;
+    }
+
+    Some(claims)
+}
+
+// ─── Selbst-signiertes Zertifikat (kein Auth-Server nötig) ───────────────────
+
+/// Erzeugt ein selbst-signiertes TLS-Zertifikat für einen Node.
+/// Wird verwendet wenn kein `STONE_AUTH_URL` gesetzt ist und kein
+/// bestehendes Zertifikat vorhanden ist.
+fn generate_self_signed_cert(node_name: &str, sans: &[String], paths: &CertPaths) -> Result<()> {
+    use rcgen::generate_simple_self_signed;
+
+    let mut subject_alt_names: Vec<String> = sans.to_vec();
+    if !subject_alt_names.iter().any(|s| s == "localhost") {
+        subject_alt_names.push("localhost".into());
+    }
+    if !subject_alt_names.iter().any(|s| s == "127.0.0.1") {
+        subject_alt_names.push("127.0.0.1".into());
+    }
+
+    let cert = generate_simple_self_signed(subject_alt_names)
+        .context("Self-signed Cert Generierung fehlgeschlagen")?;
+
+    if let Some(dir) = Path::new(&paths.cert).parent() {
+        fs::create_dir_all(dir).context("TLS-Verzeichnis anlegen")?;
+    }
+    let cert_pem = cert.serialize_pem().context("Cert PEM serialisieren")?;
+    let key_pem  = cert.serialize_private_key_pem();
+
+    fs::write(&paths.cert, &cert_pem).context("Zertifikat schreiben")?;
+    fs::write(&paths.key, &key_pem).context("Private Key schreiben")?;
+    // Self-signed: CA = das Zertifikat selbst
+    if let Some(dir) = Path::new(&paths.ca).parent() {
+        fs::create_dir_all(dir).ok();
+    }
+    let _ = fs::write(&paths.ca, &cert_pem);
+
+    println!(
+        "[tls] Self-signed Zertifikat generiert für '{}' → {}",
+        node_name, paths.cert
+    );
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -383,18 +516,22 @@ pub async fn ensure_node_certificate(cfg: NodeCertConfig) -> Result<CertPaths> {
     {
         Some(u) => u,
         None => {
-            // Kein Auth-Server hinterlegt: Wenn bestehende Zertifikate da sind, verwende sie einfach.
+            // Kein Auth-Server hinterlegt:
+            // 1. Bestehendes Zertifikat? → Verwenden
             if Path::new(&paths.cert).exists() && Path::new(&paths.key).exists() {
                 println!(
-                    "[tls] Keine STONE_AUTH_URL gesetzt – nutze bestehendes Zertifikat unter {}",
+                    "[tls] Keine STONE_AUTH_URL – nutze bestehendes Zertifikat ({})",
                     paths.cert
                 );
                 return Ok(paths);
-            } else {
-                return Err(anyhow!(
-                    "STONE_AUTH_URL nicht gesetzt und kein bestehendes Zertifikat vorhanden"
-                ));
             }
+            // 2. Kein Zertifikat → Self-signed generieren (kein Auth-Server nötig)
+            println!(
+                "[tls] Keine STONE_AUTH_URL – generiere self-signed Zertifikat für '{}' …",
+                cfg.node_name
+            );
+            generate_self_signed_cert(&cfg.node_name, &sans, &paths)?;
+            return Ok(paths);
         }
     };
 

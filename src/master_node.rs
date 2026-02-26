@@ -260,6 +260,37 @@ pub enum NodeEvent {
         dropped_blocks: u64,
         reason: String,
     },
+    // ─── Web-of-Trust Events ──────────────────────────────────────────────────
+    /// Neuer Node beantragt Beitritt
+    TrustJoinRequested {
+        peer_id: String,
+        name: Option<String>,
+        timestamp: i64,
+    },
+    /// Node wurde durch Abstimmung genehmigt
+    TrustApproved {
+        peer_id: String,
+        voter: String,
+        votes_for: usize,
+        timestamp: i64,
+    },
+    /// Node wurde durch Abstimmung widerrufen
+    TrustRevoked {
+        peer_id: String,
+        voter: String,
+        votes_against: usize,
+        timestamp: i64,
+    },
+    /// Abstimmungsstimme empfangen (noch kein Quorum)
+    TrustVoteCast {
+        peer_id: String,
+        voter: String,
+        approve: bool,
+        votes_for: usize,
+        votes_against: usize,
+        needed: usize,
+        timestamp: i64,
+    },
 }
 
 // ─── Event-Bus ───────────────────────────────────────────────────────────────
@@ -565,7 +596,13 @@ impl MasterNodeState {
         if reg.iter().any(|e| e.peer_id == peer_id) {
             return Err(format!("peer_id '{peer_id}' bereits in der Trust-Registry"));
         }
-        reg.push(TrustEntry::new(peer_id, public_key_hex, name));
+        reg.push(TrustEntry::new(peer_id.clone(), public_key_hex, name.clone()));
+        drop(reg);
+        self.events.publish(NodeEvent::TrustJoinRequested {
+            peer_id,
+            name,
+            timestamp: Utc::now().timestamp(),
+        });
         Ok(())
     }
 
@@ -624,7 +661,44 @@ impl MasterNodeState {
             entry.decided_at = Some(Utc::now().timestamp());
         }
 
-        Ok(entry.status.clone())
+        let new_status = entry.status.clone();
+        let votes_for = entry.votes_approve.len();
+        let votes_against = entry.votes_reject.len();
+        drop(reg);
+
+        // WS-Event emittieren
+        let now = Utc::now().timestamp();
+        match new_status {
+            TrustStatus::Active => {
+                self.events.publish(NodeEvent::TrustApproved {
+                    peer_id: target_peer_id.to_string(),
+                    voter: voter_peer_id.to_string(),
+                    votes_for,
+                    timestamp: now,
+                });
+            }
+            TrustStatus::Revoked => {
+                self.events.publish(NodeEvent::TrustRevoked {
+                    peer_id: target_peer_id.to_string(),
+                    voter: voter_peer_id.to_string(),
+                    votes_against,
+                    timestamp: now,
+                });
+            }
+            TrustStatus::Pending => {
+                self.events.publish(NodeEvent::TrustVoteCast {
+                    peer_id: target_peer_id.to_string(),
+                    voter: voter_peer_id.to_string(),
+                    approve,
+                    votes_for,
+                    votes_against,
+                    needed: threshold,
+                    timestamp: now,
+                });
+            }
+        }
+
+        Ok(new_status)
     }
 
     /// Zusammenfassung für NodeStatusResponse

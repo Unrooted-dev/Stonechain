@@ -4,5 +4,6 @@ pub mod consensus;
 pub mod crypto;
 pub mod master_node;
 pub mod network;
+pub mod psk;
 pub mod storage;
 pub mod tls;

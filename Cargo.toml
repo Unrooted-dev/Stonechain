@@ -57,6 +57,7 @@ reqwest = { version = "0.11", default-features = false, features = ["json", "rus
 bip39           = { version = "1.2", default-features = false, features = ["std", "rand"] }
 x509-parser     = "0.16"
 rcgen           = "0.12"
+pbkdf2          = { version = "0.12", features = ["hmac"] }
 # Ed25519 Schlüsselpaar, Signierung und Verifikation
 ed25519-dalek   = { version = "2.1", features = ["rand_core"] }
 # X25519 Diffie-Hellman für ECDH-Schlüsselableitung (Verschlüsselung)
@@ -78,6 +79,7 @@ libp2p = { version = "0.54", features = [
     "tokio",
     "macros",
     "ed25519",
+    "pnet",
 ] }
 
 # Hilfsmittel

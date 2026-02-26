@@ -35,14 +35,16 @@
 //! | `stone/peers/v1`   | Peer-Ankündigungen                   |
 
 use crate::blockchain::Block;
+use crate::psk::load_pnet_key;
 use futures_util::StreamExt;
 use libp2p::{
-    Multiaddr, PeerId, Swarm, SwarmBuilder,
+    Multiaddr, PeerId, Swarm, SwarmBuilder, Transport as _,
     gossipsub::{self, IdentTopic, MessageAuthenticity},
     identify,
     kad::{self, store::MemoryStore},
     mdns,
     noise,
+    pnet,
     request_response::{self, ProtocolSupport},
     swarm::SwarmEvent,
     tcp,
@@ -412,21 +414,55 @@ pub fn build_swarm(
         block_exchange,
     };
 
-    // ── Transport: TCP + Noise (Ed25519-Auth) + Yamux ─────────────────────────
-    let swarm = SwarmBuilder::with_existing_identity(keypair)
-        .with_tokio()
-        .with_tcp(
-            tcp::Config::default().nodelay(true),
-            noise::Config::new,
-            yamux::Config::default,
-        )?
-        .with_behaviour(|_| behaviour)?
-        .with_swarm_config(|cfg| {
-            cfg.with_idle_connection_timeout(Duration::from_secs(
-                config.connection_timeout_secs * 2,
-            ))
-        })
-        .build();
+    // ── Transport: TCP + PSK (pnet) + Noise (Ed25519-Auth) + Yamux ────────────
+    //
+    // Schicht-Reihenfolge (von außen nach innen):
+    //   TCP → pnet (symmetr. Verschlüssel./Auth via PSK) → Noise (Peer-Authen.) → Yamux
+    //
+    // Ohne gültigen PSK schlägt der pnet-Handshake fehl → Node wird nicht verbunden.
+    // Das ersetzt den zentralen Auth-Server für Node-Joins vollständig.
+    let pnet_key = load_pnet_key();
+
+    let swarm = if let Some(psk) = pnet_key {
+        // PSK aktiv: pnet-Layer vor Noise einschalten
+        let pnet_config = pnet::PnetConfig::new(psk);
+        SwarmBuilder::with_existing_identity(keypair)
+            .with_tokio()
+            .with_other_transport(|key| {
+                let noise_config = noise::Config::new(key)?;
+                let base = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true));
+                let transport = base
+                    .and_then(move |socket, _endpoint| pnet_config.handshake(socket))
+                    .upgrade(libp2p::core::upgrade::Version::V1)
+                    .authenticate(noise_config)
+                    .multiplex(yamux::Config::default())
+                    .boxed();
+                Ok(transport)
+            })?
+            .with_behaviour(|_| behaviour)?
+            .with_swarm_config(|cfg| {
+                cfg.with_idle_connection_timeout(Duration::from_secs(
+                    config.connection_timeout_secs * 2,
+                ))
+            })
+            .build()
+    } else {
+        // PSK deaktiviert: Standard TCP + Noise + Yamux
+        SwarmBuilder::with_existing_identity(keypair)
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default().nodelay(true),
+                noise::Config::new,
+                yamux::Config::default,
+            )?
+            .with_behaviour(|_| behaviour)?
+            .with_swarm_config(|cfg| {
+                cfg.with_idle_connection_timeout(Duration::from_secs(
+                    config.connection_timeout_secs * 2,
+                ))
+            })
+            .build()
+    };
 
     Ok(swarm)
 }
