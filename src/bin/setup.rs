@@ -53,6 +53,9 @@ struct Config {
     psk_enabled:     bool,
     psk_secret:      Option<String>,
     api_key:         String,
+    tunnel_mode:     String,           // "quick" | "named" | "off"
+    tunnel_token:    Option<String>,
+    tunnel_domain:   Option<String>,
 }
 
 // ─── Einstiegspunkt ──────────────────────────────────────────────────────────
@@ -339,8 +342,73 @@ fn main() {
         }
     };
 
-    // ── Schritt 7: API-Key ────────────────────────────────────────────────────
-    section("7 / 7", "Admin API-Key");
+    // ── Schritt 7: Öffentlicher Zugang (Cloudflare Tunnel) ───────────────────
+    section("7 / 8", "Öffentlicher Zugang");
+
+    println!("{}", style("  Damit andere Nodes dich erreichen können, ohne Port-Freigabe:").dim());
+    println!("{}", style("  Cloudflare Tunnel leitet eine öffentliche HTTPS-URL zu deiner Node.").dim());
+    println!("{}", style("  Kein Router, kein Port-Forwarding, funktioniert hinter NAT/CGNAT.").dim());
+    println!();
+
+    let tunnel_choices = &[
+        "Quick-Tunnel  (keine Anmeldung – temporäre *.trycloudflare.com URL)",
+        "Named-Tunnel  (Cloudflare-Account – feste URL, z.B. meinnode.unrooted.dev)",
+        "Kein Tunnel   (nur lokales Netzwerk / manuelle Port-Freigabe)",
+    ];
+    let tunnel_choice = FuzzySelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("Öffentlicher Zugang")
+        .items(tunnel_choices)
+        .default(0)
+        .interact()
+        .unwrap();
+
+    let (tunnel_mode, tunnel_token, tunnel_domain) = match tunnel_choice {
+        0 => {
+            // cloudflared prüfen
+            let cf_available = std::process::Command::new("which")
+                .arg("cloudflared")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+                || Path::new("/opt/homebrew/bin/cloudflared").exists()
+                || Path::new("/usr/local/bin/cloudflared").exists();
+
+            if !cf_available {
+                println!(
+                    "{} cloudflared nicht gefunden. Installieren mit:",
+                    style("!").yellow()
+                );
+                println!("   {}", style("brew install cloudflared").green());
+                println!("{} Quick-Tunnel wird trotzdem konfiguriert.", style("ℹ").cyan());
+                println!("{} Falls cloudflared beim Node-Start fehlt, wird die Node normal gestartet.", style("ℹ").dim());
+            } else {
+                println!("{} cloudflared gefunden – Quick-Tunnel wird beim Node-Start automatisch aktiviert.", style("✓").green());
+            }
+            ("quick", None, None)
+        }
+        1 => {
+            println!("{} Named-Tunnel benötigt ein Cloudflare-Konto und einen Tunnel-Token.", style("ℹ").cyan());
+            println!("  Token erstellen unter: {}", style("https://one.dash.cloudflare.com → Zero Trust → Tunnels").cyan());
+            println!();
+            let token: String = Password::with_theme(&ColorfulTheme::default())
+                .with_prompt("Tunnel-Token")
+                .interact()
+                .unwrap();
+            let domain: String = Input::with_theme(&ColorfulTheme::default())
+                .with_prompt("Öffentliche Domain (z.B. meinnode.unrooted.dev)")
+                .interact_text()
+                .unwrap();
+            println!("{} Named-Tunnel konfiguriert: {}", style("✓").green(), style(&domain).cyan());
+            ("named", Some(token), Some(domain))
+        }
+        _ => {
+            println!("{} Kein Tunnel – Node ist nur lokal erreichbar.", style("ℹ").cyan());
+            ("off", None, None)
+        }
+    };
+
+    // ── Schritt 8: API-Key ────────────────────────────────────────────────────
+    section("8 / 8", "Admin API-Key");
     let api_key_choices = &[
         "Automatisch generieren (empfohlen)",
         "Eigenen API-Key eingeben",
@@ -384,6 +452,9 @@ fn main() {
         psk_enabled,
         psk_secret,
         api_key,
+        tunnel_mode: tunnel_mode.to_string(),
+        tunnel_token,
+        tunnel_domain,
     };
 
     // ── .env schreiben ────────────────────────────────────────────────────────
@@ -499,6 +570,33 @@ fn write_env(cfg: &Config) {
     lines.push("# Für Cluster-Betrieb: stone_data/tls/root.crt + root.key auf alle Nodes kopieren.".into());
     lines.push(format!("STONE_TLS_CERT={}/tls/node.crt", cfg.data_dir.display()));
     lines.push(format!("STONE_TLS_KEY={}/tls/node.key", cfg.data_dir.display()));
+
+    lines.push("".into());
+    lines.push("# ── Cloudflare Tunnel ───────────────────────────────────────────────────".into());
+    lines.push("# quick   = temporäre *.trycloudflare.com URL (kein Account nötig)".into());
+    lines.push("# named   = feste URL via Cloudflare-Token (STONE_TUNNEL_TOKEN setzen)".into());
+    lines.push("# off/leer = kein Tunnel".into());
+    match cfg.tunnel_mode.as_str() {
+        "quick" => {
+            lines.push("STONE_TUNNEL=quick".into());
+            lines.push("# STONE_TUNNEL_TOKEN=".into());
+            lines.push("# STONE_TUNNEL_DOMAIN=".into());
+        }
+        "named" => {
+            lines.push("STONE_TUNNEL=named".into());
+            if let Some(ref token) = cfg.tunnel_token {
+                lines.push(format!("STONE_TUNNEL_TOKEN={}", token));
+            }
+            if let Some(ref domain) = cfg.tunnel_domain {
+                lines.push(format!("STONE_TUNNEL_DOMAIN={}", domain));
+            }
+        }
+        _ => {
+            lines.push("# STONE_TUNNEL=quick".into());
+            lines.push("# STONE_TUNNEL_TOKEN=".into());
+            lines.push("# STONE_TUNNEL_DOMAIN=".into());
+        }
+    }
 
     let content = lines.join("\n") + "\n";
     fs::write(".env", &content).unwrap_or_else(|e| {
@@ -694,6 +792,12 @@ fn print_summary(cfg: &Config) {
     kv("PSK / pnet",      if cfg.psk_enabled { "aktiviert" } else { "deaktiviert" });
     kv("API-Key",         &format!("{}…", &cfg.api_key[..12.min(cfg.api_key.len())]));
     kv("TLS",             "aktiv (Embedded-CA, auto-verwaltet)");
+    let tunnel_summary = match cfg.tunnel_mode.as_str() {
+        "quick" => "Quick-Tunnel (*.trycloudflare.com)".to_string(),
+        "named" => format!("Named-Tunnel → {}", cfg.tunnel_domain.as_deref().unwrap_or("?")),
+        _       => "deaktiviert".to_string(),
+    };
+    kv("Tunnel",          &tunnel_summary);
     println!();
 }
 

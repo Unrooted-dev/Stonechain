@@ -7,3 +7,4 @@ pub mod network;
 pub mod psk;
 pub mod storage;
 pub mod tls;
+pub mod tunnel;

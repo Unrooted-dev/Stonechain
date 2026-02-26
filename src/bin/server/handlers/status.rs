@@ -22,6 +22,26 @@ pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
             "role": format!("{:?}", state.node.role),
             "block_height": summary.block_height,
             "latest_hash": &summary.latest_hash[..12.min(summary.latest_hash.len())],
+            // Öffentliche URL (gesetzt wenn Cloudflare Tunnel aktiv)
+            "public_url": std::env::var("STONE_PUBLIC_URL").ok(),
+        })),
+    )
+}
+
+/// GET /api/v1/info — Öffentliche Node-Info (kein Auth), für Peer-Discovery
+pub async fn handle_info(State(state): State<AppState>) -> impl IntoResponse {
+    let summary = state.node.chain_summary();
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "node_id":    state.node.node_id,
+            "role":       format!("{:?}", state.node.role),
+            "block_height": summary.block_height,
+            // Öffentliche URL — gesetzt wenn Cloudflare Tunnel aktiv
+            // Clients können diese URL nutzen um den Peer zu erreichen
+            "public_url": std::env::var("STONE_PUBLIC_URL").ok(),
+            // Letzte bekannte Tunnel-URL (aus Datei, persistiert über Restarts)
+            "last_tunnel_url": stone::tunnel::read_last_tunnel_url(),
         })),
     )
 }

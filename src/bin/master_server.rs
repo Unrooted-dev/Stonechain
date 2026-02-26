@@ -30,7 +30,7 @@
 #[path = "server/mod.rs"]
 mod server;
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use stone::{
     auth::load_users,
@@ -43,7 +43,7 @@ use stone::{
 use server::{
     router::build_router,
     state::{load_api_key, load_peers_from_disk, load_trust_from_disk, AppState, HEARTBEAT_INTERVAL},
-    sync::{fetch_missing_chunks, pull_from_peer, spawn_auto_sync_task},
+    sync::{announce_public_url, fetch_missing_chunks, pull_from_peer, spawn_auto_sync_task},
 };
 
 #[tokio::main]
@@ -287,6 +287,43 @@ async fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(if use_tls { 443 } else { 8080 });
 
+    // ── Cloudflare Tunnel (optional) ──────────────────────────────────────────
+    // Gestartet wenn STONE_TUNNEL=quick oder STONE_TUNNEL=named gesetzt ist.
+    // Läuft in einem eigenen Thread parallel zum Server — blockiert nicht den Start.
+    if stone::tunnel::tunnel_mode_from_env().is_some() {
+        let tunnel_port = preferred_port;
+        let node_ann  = node.clone();
+        let key_ann   = api_key.clone();
+        std::thread::spawn(move || {
+            // Kurz warten bis der Server gebunden hat
+            std::thread::sleep(Duration::from_secs(2));
+            println!("[tunnel] Cloudflare Tunnel wird gestartet…");
+            match stone::tunnel::start_tunnel(tunnel_port) {
+                Ok(handle) => {
+                    println!(
+                        "[tunnel] ✓ Öffentliche URL: {}",
+                        handle.info.public_url
+                    );
+                    std::env::set_var("STONE_PUBLIC_URL", &handle.info.public_url);
+                    // URL an Peers melden (braucht Tokio-Runtime → in neuem Runtime ausführen)
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        announce_public_url(node_ann, key_ann).await;
+                    });
+                    // Handle am Leben halten bis Thread endet (= bis Prozess endet)
+                    loop {
+                        std::thread::sleep(Duration::from_secs(60));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[tunnel] ✗ Tunnel fehlgeschlagen: {e}");
+                    eprintln!("[tunnel]   Node läuft weiter ohne öffentlichen Zugang.");
+                }
+            }
+        });
+    }
+
     if use_tls {
         let cert_path = std::env::var("STONE_TLS_CERT").unwrap();
         let key_path  = std::env::var("STONE_TLS_KEY").unwrap();
@@ -303,7 +340,16 @@ async fn main() {
         )
         .serve(router.into_make_service())
         .await
-        .expect("HTTPS-Server Fehler");
+        .unwrap_or_else(|e| {
+            if e.to_string().contains("Address already in use") || e.to_string().contains("48") {
+                eprintln!("[master] ❌ Port {preferred_port} ist bereits belegt!");
+                eprintln!("[master]   Lösungen:");
+                eprintln!("[master]   1) Alte Prozesse beenden:  pkill -f stone-master");
+                eprintln!("[master]   2) Anderen Port nutzen:    STONE_PORT={} in .env", preferred_port + 1);
+                std::process::exit(1);
+            }
+            panic!("HTTPS-Server Fehler: {e}");
+        });
     } else {
         let listener = bind_with_fallback(preferred_port).await;
         let bound_port = listener.local_addr().unwrap().port();

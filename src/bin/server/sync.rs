@@ -405,3 +405,66 @@ pub async fn pull_users_from_peer(
         println!("[sync] {added} neue Nutzer von {peer_url} übernommen");
     }
 }
+
+/// Meldet die eigene öffentliche URL (STONE_PUBLIC_URL) an alle bekannten Peers.
+///
+/// Wird nach dem Tunnel-Start aufgerufen damit Peers sofort die neue URL kennen.
+/// Peers speichern die URL über `POST /api/v1/peers` — alte Einträge werden überschrieben.
+pub async fn announce_public_url(node: Arc<MasterNodeState>, api_key: Arc<String>) {
+    let public_url = match std::env::var("STONE_PUBLIC_URL") {
+        Ok(u) if !u.is_empty() => u,
+        _ => return, // Kein Tunnel aktiv → nichts zu melden
+    };
+
+    let node_id = node.node_id.clone();
+    let peers = node.get_peers();
+
+    if peers.is_empty() {
+        println!("[tunnel] Keine Peers bekannt – URL-Announcement übersprungen.");
+        return;
+    }
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .danger_accept_invalid_certs(
+            std::env::var("STONE_INSECURE_SSL")
+                .map(|v| v == "1")
+                .unwrap_or(false),
+        )
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    println!(
+        "[tunnel] Melde öffentliche URL an {} Peer(s): {}",
+        peers.len(),
+        public_url
+    );
+
+    for peer in &peers {
+        let url = format!("{}/api/v1/peers", peer.url.trim_end_matches('/'));
+        let body = serde_json::json!({
+            "url":  public_url,
+            "name": node_id,
+        });
+        match client
+            .post(&url)
+            .header("x-api-key", api_key.as_str())
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                println!("[tunnel] ✓ URL gemeldet an {}", peer.url);
+            }
+            Ok(r) => {
+                eprintln!("[tunnel] {} – HTTP {} beim URL-Announcement", peer.url, r.status());
+            }
+            Err(e) => {
+                eprintln!("[tunnel] {} – Fehler beim URL-Announcement: {e}", peer.url);
+            }
+        }
+    }
+}
