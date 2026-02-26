@@ -197,8 +197,7 @@ pub fn validate_local_token(token: &str, cluster_key: &str) -> Option<LocalToken
 // ─── Selbst-signiertes Zertifikat (kein Auth-Server nötig) ───────────────────
 
 /// Erzeugt ein selbst-signiertes TLS-Zertifikat für einen Node.
-/// Wird verwendet wenn kein `STONE_AUTH_URL` gesetzt ist und kein
-/// bestehendes Zertifikat vorhanden ist.
+/// Wird verwendet wenn weder Auth-Server noch Embedded-CA verfügbar sind.
 fn generate_self_signed_cert(node_name: &str, sans: &[String], paths: &CertPaths) -> Result<()> {
     use rcgen::generate_simple_self_signed;
 
@@ -232,6 +231,264 @@ fn generate_self_signed_cert(node_name: &str, sans: &[String], paths: &CertPaths
         node_name, paths.cert
     );
     Ok(())
+}
+
+// ─── Embedded-CA: Node signiert ihr eigenes Zertifikat ────────────────────────
+//
+// Konzept: Die root.crt + root.key liegen im data_dir/tls/ (werden einmal
+// generiert und zwischen Nodes geteilt). Jede Node:
+//  1. Lädt die gemeinsame Root-CA
+//  2. Stellt sich daraus ihr eigenes Node-Zertifikat aus
+//  3. Andere Nodes akzeptieren das Zertifikat, weil sie dieselbe Root-CA kennen
+//
+// → Kein zentraler Auth-Server nötig. Jede Node ist ihr eigener "CA-Client".
+//   Die Sicherheit liegt im Teilen der root.key (über PSK-Kanal, manuell, etc.)
+
+/// Sucht die Embedded-CA in dieser Reihenfolge:
+/// 1. `STONE_CA_CERT` + `STONE_CA_KEY` (explizit konfiguriert)
+/// 2. `<data_dir>/tls/root.crt` + `<data_dir>/tls/root.key`
+/// 3. `tls/root.crt` + `tls/root.key` (Projekt-Root, Legacy)
+pub fn find_embedded_ca() -> Option<(String, String)> {
+    // 1. Explizit per Env
+    if let (Ok(cert), Ok(key)) = (
+        std::env::var("STONE_CA_CERT"),
+        std::env::var("STONE_CA_KEY"),
+    ) {
+        if Path::new(&cert).is_file() && Path::new(&key).is_file() {
+            return Some((cert, key));
+        }
+    }
+
+    // 2. Im data_dir/tls/
+    let data_dir = crate::blockchain::data_dir();
+    let ca_crt = format!("{}/tls/root.crt", data_dir);
+    let ca_key = format!("{}/tls/root.key", data_dir);
+    if Path::new(&ca_crt).is_file() && Path::new(&ca_key).is_file() {
+        return Some((ca_crt, ca_key));
+    }
+
+    // 3. Projekt-Root legacy
+    if Path::new("tls/root.crt").is_file() && Path::new("tls/root.key").is_file() {
+        return Some(("tls/root.crt".into(), "tls/root.key".into()));
+    }
+
+    None
+}
+
+/// Stellt ein Node-Zertifikat aus, das von der Embedded-CA signiert ist.
+/// Gibt `Ok(true)` zurück wenn erfolgreich, `Ok(false)` wenn keine CA verfügbar.
+pub fn issue_from_embedded_ca(
+    node_name: &str,
+    sans: &[String],
+    paths: &CertPaths,
+) -> Result<bool> {
+    use rcgen::{
+        BasicConstraints, Certificate, CertificateParams, IsCa, KeyPair,
+        KeyUsagePurpose, SanType,
+    };
+
+    let (ca_crt_path, ca_key_path) = match find_embedded_ca() {
+        Some(p) => p,
+        None => return Ok(false),
+    };
+
+    // CA laden
+    let ca_key_pem = fs::read_to_string(&ca_key_path)
+        .with_context(|| format!("CA-Key lesen: {}", ca_key_path))?;
+    let ca_crt_pem = fs::read_to_string(&ca_crt_path)
+        .with_context(|| format!("CA-Cert lesen: {}", ca_crt_path))?;
+
+    let keypair = KeyPair::from_pem(&ca_key_pem)
+        .context("CA-KeyPair parsen fehlgeschlagen")?;
+
+    let mut ca_params = CertificateParams::default();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    ca_params.alg = &rcgen::PKCS_ECDSA_P256_SHA256;
+    ca_params.distinguished_name.push(rcgen::DnType::CommonName, "Stone-CA");
+    ca_params.key_pair = Some(keypair);
+
+    let ca_cert = Certificate::from_params(ca_params)
+        .context("CA-Zertifikat rekonstruieren fehlgeschlagen")?;
+
+    // Node-Zertifikat ausstellen
+    let mut node_params = CertificateParams::default();
+    node_params.distinguished_name.push(rcgen::DnType::CommonName, node_name);
+    node_params.alg = &rcgen::PKCS_ECDSA_P256_SHA256;
+    node_params.is_ca = IsCa::NoCa;
+
+    let mut all_sans: Vec<String> = sans.to_vec();
+    if !all_sans.iter().any(|s| s == "localhost") {
+        all_sans.push("localhost".into());
+    }
+    if !all_sans.iter().any(|s| s == "127.0.0.1") {
+        all_sans.push("127.0.0.1".into());
+    }
+
+    for s in &all_sans {
+        if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+            node_params.subject_alt_names.push(SanType::IpAddress(ip));
+        } else {
+            node_params.subject_alt_names.push(SanType::DnsName(s.clone()));
+        }
+    }
+
+    let node_cert = Certificate::from_params(node_params)
+        .context("Node-Zertifikat Parameter fehlgeschlagen")?;
+
+    let cert_pem = node_cert
+        .serialize_pem_with_signer(&ca_cert)
+        .context("Node-Zertifikat signieren fehlgeschlagen")?;
+    let key_pem = node_cert.serialize_private_key_pem();
+
+    // Auf Disk schreiben
+    if let Some(dir) = Path::new(&paths.cert).parent() {
+        fs::create_dir_all(dir).context("TLS-Verzeichnis anlegen")?;
+    }
+    fs::write(&paths.cert, &cert_pem).context("Node-Cert schreiben")?;
+    fs::write(&paths.key, &key_pem).context("Node-Key schreiben")?;
+
+    // Root-CA an den erwarteten CA-Pfad kopieren (für Client-Verifikation)
+    if let Some(dir) = Path::new(&paths.ca).parent() {
+        fs::create_dir_all(dir).ok();
+    }
+    if !Path::new(&paths.ca).exists() || paths.ca != ca_crt_path {
+        fs::write(&paths.ca, &ca_crt_pem).context("Root-CA kopieren fehlgeschlagen")?;
+    }
+
+    let ca_fp = hex::encode(&sha2::Sha256::digest(ca_crt_pem.as_bytes())[..8]);
+    println!(
+        "[tls] ✓ Node-Cert von Embedded-CA signiert für '{}' (CA-fp: {}…) → {}",
+        node_name, ca_fp, paths.cert
+    );
+    Ok(true)
+}
+
+/// Erzeugt (falls noch nicht vorhanden) die Root-CA für eine neue Node-Instanz.
+/// Wird aufgerufen wenn weder Auth-Server noch bestehende CA vorhanden ist.
+pub fn ensure_embedded_ca() -> Result<()> {
+    use rcgen::{BasicConstraints, Certificate, CertificateParams, IsCa, KeyUsagePurpose};
+
+    let data_dir = crate::blockchain::data_dir();
+    let ca_dir   = format!("{}/tls", data_dir);
+    let ca_crt   = format!("{}/root.crt", ca_dir);
+    let ca_key   = format!("{}/root.key", ca_dir);
+
+    if Path::new(&ca_crt).is_file() && Path::new(&ca_key).is_file() {
+        return Ok(()); // bereits vorhanden
+    }
+
+    fs::create_dir_all(&ca_dir).context("CA-Verzeichnis anlegen")?;
+
+    let mut params = CertificateParams::default();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    params.alg = &rcgen::PKCS_ECDSA_P256_SHA256;
+    params.distinguished_name.push(rcgen::DnType::CommonName, "Stone-CA");
+
+    let cert = Certificate::from_params(params)
+        .context("Root-CA Generierung fehlgeschlagen")?;
+
+    let cert_pem = cert.serialize_pem().context("Root-CA PEM serialisieren")?;
+    let key_pem  = cert.serialize_private_key_pem();
+
+    fs::write(&ca_crt, &cert_pem).context("Root-CA Cert schreiben")?;
+    fs::write(&ca_key, &key_pem).context("Root-CA Key schreiben")?;
+
+    let fp = hex::encode(&sha2::Sha256::digest(cert_pem.as_bytes())[..8]);
+    println!(
+        "[tls] ✓ Neue Root-CA erzeugt (fp: {}…) → {}",
+        fp, ca_crt
+    );
+    println!(
+        "[tls]   → Für Cluster-Betrieb: root.crt + root.key auf alle Nodes kopieren"
+    );
+    println!(
+        "[tls]   → Pfad: {}", ca_dir
+    );
+    Ok(())
+}
+
+/// Ergebnis von `bootstrap_tls` — für Anzeige im Setup-Wizard.
+pub enum TlsBootstrapStatus {
+    /// Root-CA und Node-Zertifikat wurden neu erstellt.
+    Created,
+    /// Bestehendes Zertifikat ist gültig und wurde beibehalten.
+    Reused,
+    /// Zertifikat war ungültig oder nicht von der CA signiert — wurde neu ausgestellt.
+    Renewed,
+}
+
+/// Stellt sicher dass CA + Node-Zertifikat vorhanden und gültig sind.
+///
+/// Ablauf:
+///  1. CA erzeugen (falls noch nicht da)
+///  2. Node-Cert prüfen (Gültigkeit, Issuer)
+///  3. Bei Bedarf neues Node-Cert ausstellen
+///
+/// Diese Funktion ist **synchron** und kann ohne Tokio-Runtime aufgerufen werden.
+pub fn bootstrap_tls(data_dir: &std::path::Path) -> anyhow::Result<TlsBootstrapStatus> {
+    let tls_dir  = data_dir.join("tls");
+    let ca_crt   = tls_dir.join("root.crt");
+    let ca_key   = tls_dir.join("root.key");
+    let node_crt = tls_dir.join("node.crt");
+    let node_key = tls_dir.join("node.key");
+
+    // ── 1. CA sicherstellen ──────────────────────────────────────────────────
+    if !ca_crt.is_file() || !ca_key.is_file() {
+        use rcgen::{BasicConstraints, Certificate, CertificateParams, IsCa, KeyUsagePurpose};
+
+        fs::create_dir_all(&tls_dir)
+            .with_context(|| format!("TLS-Verzeichnis anlegen: {}", tls_dir.display()))?;
+
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params.alg = &rcgen::PKCS_ECDSA_P256_SHA256;
+        params.distinguished_name.push(rcgen::DnType::CommonName, "Stone-CA");
+
+        let cert = Certificate::from_params(params)
+            .context("Root-CA Generierung fehlgeschlagen")?;
+        let cert_pem = cert.serialize_pem().context("Root-CA PEM serialisieren")?;
+        let key_pem  = cert.serialize_private_key_pem();
+
+        fs::write(&ca_crt, &cert_pem).context("Root-CA Cert schreiben")?;
+        fs::write(&ca_key, &key_pem).context("Root-CA Key schreiben")?;
+    }
+
+    // ── 2. Node-Cert prüfen ──────────────────────────────────────────────────
+    let cert_ok = node_crt.is_file()
+        && cert_is_valid(node_crt.to_str().unwrap_or(""), Duration::from_secs(7 * 24 * 3600))
+        && issuer_matches_ca(
+            node_crt.to_str().unwrap_or(""),
+            ca_crt.to_str().unwrap_or(""),
+        );
+
+    if cert_ok {
+        return Ok(TlsBootstrapStatus::Reused);
+    }
+
+    let was_missing = !node_crt.is_file();
+
+    // ── 3. Node-Cert ausstellen ──────────────────────────────────────────────
+    let paths = CertPaths {
+        cert: node_crt.to_string_lossy().into_owned(),
+        key:  node_key.to_string_lossy().into_owned(),
+        ca:   ca_crt.to_string_lossy().into_owned(),
+    };
+
+    let node_name = std::env::var("STONE_NODE_NAME").unwrap_or_else(|_| "stone-node".into());
+    let issued = issue_from_embedded_ca(&node_name, &[], &paths)?;
+
+    if !issued {
+        anyhow::bail!("Node-Zertifikat konnte nicht ausgestellt werden (keine CA verfügbar)");
+    }
+
+    if was_missing {
+        Ok(TlsBootstrapStatus::Created)
+    } else {
+        Ok(TlsBootstrapStatus::Renewed)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -299,7 +556,7 @@ fn allow_insecure_tls() -> bool {
         .unwrap_or(false)
 }
 
-fn cert_is_valid(cert_path: &str, margin: Duration) -> bool {
+pub fn cert_is_valid(cert_path: &str, margin: Duration) -> bool {
     let data = match std::fs::read(cert_path) {
         Ok(d) => d,
         Err(_) => return false,
@@ -326,7 +583,7 @@ fn cert_is_valid(cert_path: &str, margin: Duration) -> bool {
     }
 }
 
-fn issuer_matches_ca(cert_path: &str, ca_path: &str) -> bool {
+pub fn issuer_matches_ca(cert_path: &str, ca_path: &str) -> bool {
     let cert_bytes = match std::fs::read(cert_path) {
         Ok(d) => d,
         Err(_) => return false,
@@ -516,8 +773,8 @@ pub async fn ensure_node_certificate(cfg: NodeCertConfig) -> Result<CertPaths> {
     {
         Some(u) => u,
         None => {
-            // Kein Auth-Server hinterlegt:
-            // 1. Bestehendes Zertifikat? → Verwenden
+            // Kein Auth-Server hinterlegt — Embedded-CA Priorität:
+            // 1. Bestehendes Zertifikat? → Verwenden (unverändert)
             if Path::new(&paths.cert).exists() && Path::new(&paths.key).exists() {
                 println!(
                     "[tls] Keine STONE_AUTH_URL – nutze bestehendes Zertifikat ({})",
@@ -525,11 +782,26 @@ pub async fn ensure_node_certificate(cfg: NodeCertConfig) -> Result<CertPaths> {
                 );
                 return Ok(paths);
             }
-            // 2. Kein Zertifikat → Self-signed generieren (kein Auth-Server nötig)
+            // 2. Embedded-CA vorhanden (root.crt + root.key)? → CA-signiertes Cert
+            if find_embedded_ca().is_some() {
+                println!(
+                    "[tls] Keine STONE_AUTH_URL – signiere Node-Cert mit Embedded-CA für '{}' …",
+                    cfg.node_name
+                );
+                issue_from_embedded_ca(&cfg.node_name, &sans, &paths)?;
+                return Ok(paths);
+            }
+            // 3. Keine CA → neue Root-CA + Node-Cert erzeugen
             println!(
-                "[tls] Keine STONE_AUTH_URL – generiere self-signed Zertifikat für '{}' …",
+                "[tls] Keine STONE_AUTH_URL, keine CA – erzeuge neue Root-CA + Node-Cert für '{}' …",
                 cfg.node_name
             );
+            ensure_embedded_ca()?;
+            // Jetzt ist die CA da → damit signieren
+            if issue_from_embedded_ca(&cfg.node_name, &sans, &paths)? {
+                return Ok(paths);
+            }
+            // Letzter Fallback: self-signed (sollte nicht vorkommen)
             generate_self_signed_cert(&cfg.node_name, &sans, &paths)?;
             return Ok(paths);
         }

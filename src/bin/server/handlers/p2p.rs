@@ -75,11 +75,30 @@ pub async fn handle_p2p_info(
         None => (String::from("P2P deaktiviert"), None),
     };
 
+    let psk_disabled = std::env::var("STONE_P2P_PSK_DISABLED").as_deref() == Ok("1");
+    let psk_active = !psk_disabled;
+    // Build a short fingerprint from the first 16 hex chars of the PSK secret
+    let psk_fingerprint: Option<String> = if psk_active {
+        stone::psk::export_psk_hex().map(|s| format!("sha256:{}…", &s[..16.min(s.len())]))
+    } else {
+        None
+    };
+
+    let listen_addrs: Vec<String> = match &state.network {
+        Some(_) => {
+            vec![local_addr.clone().unwrap_or_default()]
+        }
+        None => vec![],
+    };
+
     Ok(axum::Json(json!({
-        "peer_id": peer_id,
-        "p2p_addr": local_addr,
-        "p2p_port": p2p_port,
-        "p2p_active": state.network.is_some(),
+        "peer_id":          peer_id,
+        "p2p_addr":         local_addr,
+        "p2p_port":         p2p_port,
+        "p2p_active":       state.network.is_some(),
+        "psk_active":       psk_active,
+        "psk_fingerprint":  psk_fingerprint,
+        "listen_addrs":     listen_addrs,
     })))
 }
 

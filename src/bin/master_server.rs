@@ -58,6 +58,13 @@ async fn main() {
     std::fs::create_dir_all(data_dir()).expect("DATA_DIR anlegen");
     ChunkStore::new().expect("ChunkStore anlegen");
 
+    // Embedded-CA sicherstellen — falls noch keine Root-CA existiert, wird sie
+    // jetzt erzeugt und liegt bereit für TLS. Wenn TLS nicht aktiviert ist,
+    // schadet es nichts (root.key bleibt einfach ungenutzt).
+    if let Err(e) = stone::auth::ensure_embedded_ca() {
+        eprintln!("[master] Warnung: CA-Initialisierung fehlgeschlagen: {e}");
+    }
+
     let api_key = Arc::new(load_api_key());
     let node_id = std::env::var("STONE_NODE_ID")
         .or_else(|_| std::env::var("STONE_NODE_NAME"))
@@ -222,8 +229,58 @@ async fn main() {
     let router = build_router(state);
 
     // TLS-Konfiguration
-    let use_tls = std::env::var("STONE_TLS_CERT").is_ok()
-        && std::env::var("STONE_TLS_KEY").is_ok();
+    // Nur TLS aktivieren wenn STONE_TLS_CERT/KEY auf echte Dateien zeigen.
+    // Wenn die Pfade gesetzt sind aber noch nicht existieren →
+    //   automatisch ein self-signed Zertifikat generieren (via ensure_node_certificate).
+    // Wenn die Pfade auf ein Verzeichnis zeigen → Fehler mit klarem Hinweis.
+    let raw_cert = std::env::var("STONE_TLS_CERT").ok();
+    let raw_key  = std::env::var("STONE_TLS_KEY").ok();
+
+    let use_tls = match (&raw_cert, &raw_key) {
+        (Some(c), Some(k)) => {
+            // Verzeichnis angegeben? → Klarer Fehler statt Panic
+            if std::path::Path::new(c).is_dir() {
+                eprintln!("[master] ❌ STONE_TLS_CERT zeigt auf ein Verzeichnis: {c}");
+                eprintln!("[master]    Bitte den vollen Pfad zur .crt-Datei angeben,");
+                eprintln!("[master]    z.B.  STONE_TLS_CERT=stone_data/tls/node.crt");
+                std::process::exit(1);
+            }
+            if std::path::Path::new(k).is_dir() {
+                eprintln!("[master] ❌ STONE_TLS_KEY zeigt auf ein Verzeichnis: {k}");
+                eprintln!("[master]    Bitte den vollen Pfad zur .key-Datei angeben,");
+                eprintln!("[master]    z.B.  STONE_TLS_KEY=stone_data/tls/node.key");
+                std::process::exit(1);
+            }
+            // Dateien noch nicht da? → Self-signed Zertifikat erzeugen
+            if !std::path::Path::new(c).exists() || !std::path::Path::new(k).exists() {
+                println!("[master] TLS-Dateien nicht gefunden – generiere self-signed Zertifikat …");
+                let cfg = stone::auth::NodeCertConfig {
+                    auth_url: std::env::var("STONE_AUTH_URL").ok(),
+                    node_name: std::env::var("STONE_NODE_NAME").unwrap_or_else(|_| "node".into()),
+                    sans: std::env::var("STONE_NODE_SANS")
+                        .ok()
+                        .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+                        .unwrap_or_default(),
+                    node_url: std::env::var("STONE_NODE_URL").ok(),
+                };
+                match stone::auth::ensure_node_certificate(cfg).await {
+                    Ok(paths) => {
+                        // Env-Vars auf die generierten Pfade umbiegen
+                        std::env::set_var("STONE_TLS_CERT", &paths.cert);
+                        std::env::set_var("STONE_TLS_KEY",  &paths.key);
+                        println!("[master] ✓ Zertifikat bereit: {}", paths.cert);
+                    }
+                    Err(e) => {
+                        eprintln!("[master] ❌ Zertifikat-Generierung fehlgeschlagen: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            true
+        }
+        _ => false,
+    };
+
     let preferred_port: u16 = std::env::var("STONE_HTTP_PORT")
         .or_else(|_| std::env::var("STONE_PORT"))
         .ok()
@@ -232,7 +289,7 @@ async fn main() {
 
     if use_tls {
         let cert_path = std::env::var("STONE_TLS_CERT").unwrap();
-        let key_path = std::env::var("STONE_TLS_KEY").unwrap();
+        let key_path  = std::env::var("STONE_TLS_KEY").unwrap();
         let addr = SocketAddr::from(([0, 0, 0, 0], preferred_port));
         println!("[master] HTTPS auf {addr} (TLS: {cert_path})");
         println!("[master] Stone Master Node läuft auf https://{addr}");
