@@ -235,3 +235,139 @@ pub async fn handle_verify(
         })),
     ))
 }
+
+/// GET /api/v1/shards/health — Erasure-Coding Shard-Gesundheitsübersicht
+pub async fn handle_shard_health(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, Response> {
+    require_admin(&headers, &state)?;
+
+    // 1. Lokale Shard-Statistik vom Dateisystem
+    let local_stats = match stone::shard::ShardStore::new() {
+        Ok(store) => {
+            let s = store.stats();
+            json!({
+                "total_shards":       s.total_shards,
+                "total_bytes":        s.total_bytes,
+                "chunks_with_shards": s.chunks_with_shards,
+            })
+        }
+        Err(_) => json!({
+            "total_shards": 0,
+            "total_bytes": 0,
+            "chunks_with_shards": 0,
+        }),
+    };
+
+    // 2. Aus der Blockchain: alle Dokumente mit EC-Shards analysieren
+    let chain = state.node.chain.lock().unwrap();
+    let mut total_docs_ec = 0u64;
+    let mut total_chunks_ec = 0u64;
+    let mut total_shards_blockchain = 0u64;
+    let mut total_data_bytes = 0u64;
+    let mut healthy_chunks = 0u64;
+    let mut degraded_chunks = 0u64;
+    let mut critical_chunks = 0u64;
+    let mut doc_details: Vec<serde_json::Value> = Vec::new();
+
+    // ShardStore für lokale Prüfung
+    let shard_store = stone::shard::ShardStore::new().ok();
+
+    for block in &chain.blocks {
+        for doc in &block.documents {
+            let ec_chunks: Vec<_> = doc.chunks.iter().filter(|c| !c.shards.is_empty()).collect();
+            if ec_chunks.is_empty() {
+                continue;
+            }
+            total_docs_ec += 1;
+
+            let mut doc_healthy = 0u64;
+            let mut doc_degraded = 0u64;
+            let mut doc_critical = 0u64;
+
+            for chunk in &ec_chunks {
+                total_chunks_ec += 1;
+                total_shards_blockchain += chunk.shards.len() as u64;
+                total_data_bytes += chunk.size;
+
+                let k = chunk.ec_k as u64;
+
+                // Lokale Shard-Verfügbarkeit prüfen
+                let local_count = if let Some(ref store) = shard_store {
+                    store.local_shard_indices(&chunk.hash).len() as u64
+                } else {
+                    0
+                };
+
+                // Holders zählen (unique Nodes mit Shards)
+                let holder_count = chunk.shards.iter()
+                    .filter(|s| !s.holder.is_empty())
+                    .count() as u64;
+
+                // Gesundheits-Bewertung:
+                //   healthy:  >= k Shards lokal ODER holder >= k
+                //   degraded: einige Shards fehlen, aber k erreichbar
+                //   critical: weniger als k Shards bekannt
+                if local_count >= k || holder_count >= k {
+                    healthy_chunks += 1;
+                    doc_healthy += 1;
+                } else if local_count + holder_count >= k {
+                    degraded_chunks += 1;
+                    doc_degraded += 1;
+                } else {
+                    critical_chunks += 1;
+                    doc_critical += 1;
+                }
+            }
+
+            // Status des gesamten Dokuments
+            let doc_status = if doc_critical > 0 {
+                "critical"
+            } else if doc_degraded > 0 {
+                "degraded"
+            } else {
+                "healthy"
+            };
+
+            doc_details.push(json!({
+                "doc_id":    &doc.doc_id,
+                "title":     &doc.title,
+                "chunks":    ec_chunks.len(),
+                "ec_k":      ec_chunks.first().map(|c| c.ec_k).unwrap_or(0),
+                "ec_m":      ec_chunks.first().map(|c| c.ec_m).unwrap_or(0),
+                "status":    doc_status,
+                "healthy":   doc_healthy,
+                "degraded":  doc_degraded,
+                "critical":  doc_critical,
+                "size":      doc.chunks.iter().map(|c| c.size).sum::<u64>(),
+            }));
+        }
+    }
+
+    // Gesamtstatus
+    let overall_status = if critical_chunks > 0 {
+        "critical"
+    } else if degraded_chunks > 0 {
+        "degraded"
+    } else if total_chunks_ec > 0 {
+        "healthy"
+    } else {
+        "no_ec_data"
+    };
+
+    Ok((StatusCode::OK, axum::Json(json!({
+        "status": overall_status,
+        "local_store": local_stats,
+        "blockchain": {
+            "ec_documents":       total_docs_ec,
+            "ec_chunks":          total_chunks_ec,
+            "total_shards":       total_shards_blockchain,
+            "total_data_bytes":   total_data_bytes,
+            "healthy_chunks":     healthy_chunks,
+            "degraded_chunks":    degraded_chunks,
+            "critical_chunks":    critical_chunks,
+        },
+        "documents": doc_details,
+    }))))
+}

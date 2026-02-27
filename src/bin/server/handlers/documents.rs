@@ -19,7 +19,7 @@ use stone::{
 };
 
 use super::super::auth_middleware::{require_admin, require_user};
-use super::super::state::{chunk_data, reconstruct_document_data, AppState};
+use super::super::state::{chunk_data, erasure_code_document, reconstruct_document_data, AppState};
 
 // ─── Query structs ────────────────────────────────────────────────────────────
 
@@ -49,6 +49,15 @@ pub struct SearchQuery {
     pub page: Option<u64>,
     #[serde(default)]
     pub per_page: Option<u64>,
+}
+
+/// Query-Parameter für Download/Data-Endpunkt
+#[derive(Deserialize, Default)]
+pub struct DownloadQuery {
+    /// Wenn gesetzt (z.B. ?inline=1), wird Content-Disposition: inline gesendet
+    /// → Browser zeigt PDF/Text/Bilder direkt an statt herunterzuladen.
+    #[serde(default)]
+    pub inline: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -232,9 +241,14 @@ pub async fn handle_document_history(
 }
 
 /// GET /api/v1/documents/:doc_id/data – Rohdaten des Dokuments zurückgeben
+///
+/// Query-Parameter:
+///   ?inline=1  → Content-Disposition: inline (Vorschau im Browser)
+///   (ohne)     → Content-Disposition: attachment (Download erzwingen)
 pub async fn handle_get_document_data(
     headers: HeaderMap,
     Path(doc_id): Path<String>,
+    query: Query<DownloadQuery>,
     State(state): State<AppState>,
 ) -> Result<Response, Response> {
     let user = require_user(&headers, &state)?;
@@ -257,13 +271,52 @@ pub async fn handle_get_document_data(
         (doc.clone(), doc.content_type.clone())
     };
 
-    let raw_data = reconstruct_document_data(&doc_owned).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(json!({"error": e})),
+    // ── Dokument-Daten rekonstruieren ────────────────────────────────────────
+    // Für Erasure-Coded Dokumente mit P2P: fehlende Shards von Peers holen
+    let has_ec_shards = doc_owned.chunks.iter().any(|c| !c.shards.is_empty());
+
+    let raw_data = if has_ec_shards && state.network.is_some() {
+        // Async-Pfad: Remote-Shards bei Bedarf holen
+        let shard_store = stone::shard::ShardStore::new().map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"error": format!("ShardStore: {e}")})),
+            )
+                .into_response()
+        })?;
+        let chunk_store = stone::storage::ChunkStore::new().map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"error": format!("ChunkStore: {e}")})),
+            )
+                .into_response()
+        })?;
+        let network = state.network.as_ref().unwrap();
+
+        stone::storage::read_document_with_remote_shards(
+            &doc_owned,
+            &shard_store,
+            &chunk_store,
+            network,
         )
-            .into_response()
-    })?;
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"error": format!("Shard-Rekonstruktion: {e}")})),
+            )
+                .into_response()
+        })?
+    } else {
+        // Legacy-Pfad: direkt aus lokalen Chunks
+        reconstruct_document_data(&doc_owned).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"error": e})),
+            )
+                .into_response()
+        })?
+    };
 
     if !doc_owned.doc_signature.is_empty() && !doc_owned.public_key_hint.is_empty() {
         if let Some(pub_key) = load_public_key(&doc_owned.owner) {
@@ -331,13 +384,17 @@ pub async fn handle_get_document_data(
         raw_data
     };
 
+    // ?inline=1 → Vorschau im Browser; sonst Download erzwingen
+    let disposition = if query.inline.is_some() {
+        format!("inline; filename=\"{}\"", doc_owned.title)
+    } else {
+        format!("attachment; filename=\"{}\"", doc_owned.title)
+    };
+
     Ok(Response::builder()
         .status(200)
         .header("content-type", content_type)
-        .header(
-            "content-disposition",
-            format!("attachment; filename=\"{}\"", doc_owned.title),
-        )
+        .header("content-disposition", disposition)
         .body(Body::from(plaintext))
         .unwrap())
 }
@@ -478,6 +535,24 @@ pub async fn handle_upload_document(
             .into_response()
     })?;
 
+    // ── Erasure Coding: Chunks in Shards aufteilen ──────────────────────────
+    // Nur wenn P2P aktiv ist (sonst lohnt sich die Verteilung nicht)
+    let chunks = if state.network.is_some() {
+        let local_peer_id = state
+            .network
+            .as_ref()
+            .map(|n| n.local_peer_id.clone())
+            .unwrap_or_default();
+
+        erasure_code_document(&stored_bytes, &chunks, &local_peer_id).map_err(|e| {
+            eprintln!("[sharding] Erasure-Coding fehlgeschlagen: {e} – nutze Chunks ohne EC");
+            // Bei Fehler: Original-Chunks ohne Erasure Coding verwenden
+            e
+        }).unwrap_or(chunks)
+    } else {
+        chunks
+    };
+
     let version = {
         let chain = state.node.chain.lock().unwrap();
         if let Some(id) = &doc_id {
@@ -540,9 +615,38 @@ pub async fn handle_upload_document(
         let block_clone = block.clone();
         let network_clone = network.clone();
         let chain_count = state.node.chain.lock().unwrap().blocks.len() as u64;
+
+        // Block-Broadcast + Shard-Verteilung parallel in Background-Task
+        let shard_block = block.clone();
+        let shard_network = network.clone();
         tokio::spawn(async move {
+            // 1. Block an alle Peers broadcasten
             network_clone.broadcast_block(block_clone).await;
             network_clone.set_chain_count(chain_count).await;
+
+            // 2. Shards an Peers verteilen (für alle Dokumente im Block)
+            let shard_store = match stone::shard::ShardStore::new() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[sharding] ShardStore öffnen fehlgeschlagen: {e}");
+                    return;
+                }
+            };
+            for doc in &shard_block.documents {
+                let has_shards = doc.chunks.iter().any(|c| !c.shards.is_empty());
+                if has_shards {
+                    let updated = stone::storage::distribute_shards(
+                        &doc.chunks,
+                        &shard_store,
+                        &shard_network,
+                    ).await;
+                    println!(
+                        "[sharding] ✅ {} Chunks für '{}' verteilt",
+                        updated.len(),
+                        doc.title,
+                    );
+                }
+            }
         });
     }
 

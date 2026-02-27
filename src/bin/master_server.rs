@@ -61,8 +61,30 @@ async fn main() {
     // Embedded-CA sicherstellen — falls noch keine Root-CA existiert, wird sie
     // jetzt erzeugt und liegt bereit für TLS. Wenn TLS nicht aktiviert ist,
     // schadet es nichts (root.key bleibt einfach ungenutzt).
+    let ca_existed_before = stone::auth::find_embedded_ca().is_some();
     if let Err(e) = stone::auth::ensure_embedded_ca() {
         eprintln!("[master] Warnung: CA-Initialisierung fehlgeschlagen: {e}");
+    }
+    let ca_was_new = !ca_existed_before && stone::auth::find_embedded_ca().is_some();
+
+    // CA-Fingerprint beim Start loggen — wichtig für Cluster-Debugging
+    if let Some((ca_crt_path, _)) = stone::auth::find_embedded_ca() {
+        if let Ok(pem) = std::fs::read_to_string(&ca_crt_path) {
+            use sha2::Digest;
+            let fp = hex::encode(&sha2::Sha256::digest(pem.as_bytes())[..8]);
+            println!("[tls] Root-CA fp: {}… ({})", fp, ca_crt_path);
+            if ca_was_new {
+                println!("[tls] ╔══════════════════════════════════════════════════════════╗");
+                println!("[tls] ║  Neue Root-CA erzeugt. Für Cluster-Betrieb (HTTPS/WSS): ║");
+                println!("[tls] ║                                                          ║");
+                println!("[tls] ║  scp {}/tls/root.crt \\", stone::blockchain::data_dir());
+                println!("[tls] ║      {}/tls/root.key \\", stone::blockchain::data_dir());
+                println!("[tls] ║      user@other-node:/pfad/stone_data/tls/               ║");
+                println!("[tls] ║                                                          ║");
+                println!("[tls] ║  Ohne gleiche Root-CA: TLS-Fehler zwischen Nodes!        ║");
+                println!("[tls] ╚══════════════════════════════════════════════════════════╝");
+            }
+        }
     }
 
     let api_key = Arc::new(load_api_key());

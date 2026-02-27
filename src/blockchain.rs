@@ -126,6 +126,30 @@ fn default_version() -> u32 { 1 }
 pub struct ChunkRef {
     pub hash: String,
     pub size: u64,
+    /// Erasure-coded Shard-Verteilung (leer = Legacy Full-Replication)
+    #[serde(default)]
+    pub shards: Vec<ShardRef>,
+    /// Daten-Shards für Reed-Solomon (z.B. 4)
+    #[serde(default)]
+    pub ec_k: u8,
+    /// Paritäts-Shards für Reed-Solomon (z.B. 2)
+    #[serde(default)]
+    pub ec_m: u8,
+}
+
+/// Ein Shard ist ein Fragment eines erasure-coded Chunks.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ShardRef {
+    /// Original-Chunk-Hash (für Zuordnung)
+    pub chunk_hash: String,
+    /// Shard-Index: 0..k-1 = Daten, k..k+m-1 = Parität
+    pub shard_index: u8,
+    /// SHA-256 des Shard-Inhalts
+    pub shard_hash: String,
+    /// Größe des Shards in Bytes
+    pub shard_size: u64,
+    /// PeerId des Nodes der diesen Shard hält
+    pub holder: String,
 }
 
 /// Soft-Delete: markiert ein Dokument als gelöscht
@@ -397,6 +421,8 @@ impl StoneChain {
                 &block.previous_hash[..12.min(block.previous_hash.len())],
             ));
         }
+
+        // ── Hash-Integrität ───────────────────────────────────────────────
         let expected_hash = calculate_hash(&block);
         if block.hash != expected_hash {
             return Err(format!(
@@ -404,6 +430,42 @@ impl StoneChain {
                 &expected_hash[..12.min(expected_hash.len())],
                 &block.hash[..12.min(block.hash.len())],
             ));
+        }
+
+        // ── Merkle-Root-Verifikation ──────────────────────────────────────
+        let expected_merkle = compute_merkle_root(&block.documents, &block.tombstones);
+        if expected_merkle != block.merkle_root {
+            return Err(format!(
+                "Merkle-Root ungültig: erwartet {}..., empfangen {}...",
+                &expected_merkle[..12.min(expected_merkle.len())],
+                &block.merkle_root[..12.min(block.merkle_root.len())],
+            ));
+        }
+
+        // ── Timestamp-Plausibilität ───────────────────────────────────────
+        if block.index > 0 {
+            let now = Utc::now().timestamp();
+            // Nicht mehr als 5 Minuten in der Zukunft
+            if block.timestamp > now + 300 {
+                return Err(format!(
+                    "Timestamp zu weit in der Zukunft: {} Sekunden",
+                    block.timestamp - now,
+                ));
+            }
+            // Block-Timestamp muss >= Timestamp des vorherigen Blocks sein
+            if let Some(prev_block) = self.blocks.last() {
+                if block.timestamp < prev_block.timestamp {
+                    return Err(format!(
+                        "Timestamp-Regression: Block #{} ({}) < Vorgänger ({})",
+                        block.index, block.timestamp, prev_block.timestamp,
+                    ));
+                }
+            }
+        }
+
+        // ── Signer darf nicht leer sein (außer Genesis) ───────────────────
+        if block.signer.is_empty() && block.index > 0 {
+            return Err("Block hat keinen Signer".to_string());
         }
 
         // PoA: externer Signatur-Check

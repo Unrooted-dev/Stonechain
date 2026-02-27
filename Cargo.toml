@@ -84,6 +84,11 @@ libp2p = { version = "0.54", features = [
     "macros",
     "ed25519",
     "pnet",
+    "relay",
+    "dcutr",
+    "autonat",
+    "upnp",
+    "dns",
 ] }
 
 # Hilfsmittel
@@ -92,6 +97,9 @@ futures-util    = { version = "0.3", default-features = false, features = ["std"
 hostname        = "0.3"
 url             = "2.5"
 dotenvy         = "0.15"
+
+# Erasure Coding (Reed-Solomon) für Chunk-Sharding
+reed-solomon-erasure = "6.0"
 
 # ─── Setup-Wizard ────────────────────────────────────────────────────────────
 dialoguer   = { version = "0.11", features = ["fuzzy-select"] }

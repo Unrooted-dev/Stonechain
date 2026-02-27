@@ -88,7 +88,8 @@ fn main() {
         pb.set_message("TLS-Zertifikate werden geprüft…");
         pb.enable_steady_tick(Duration::from_millis(80));
 
-        match bootstrap_tls(&boot_data_dir) {
+        let tls_result = bootstrap_tls(&boot_data_dir);
+        match &tls_result {
             Ok(TlsBootstrapStatus::Created) => pb.finish_with_message(format!(
                 "{} TLS bereit — Root-CA + Node-Zertifikat neu erstellt ({})",
                 style("✓").green(),
@@ -109,6 +110,27 @@ fn main() {
                     style("!").yellow()
                 ));
             }
+        }
+        // Cluster-Hinweis: Root-CA für andere Nodes bereitstellen
+        if matches!(tls_result, Ok(TlsBootstrapStatus::Created)) {
+            let ca_crt = boot_data_dir.join("tls/root.crt");
+            let ca_key = boot_data_dir.join("tls/root.key");
+            println!();
+            println!("{}", style("  ┌─ Cluster-Setup ─────────────────────────────────────────────────┐").yellow());
+            println!("{}", style("  │  Neue Root-CA erstellt. Für HTTPS/WSS zwischen mehreren Nodes   │").yellow());
+            println!("{}", style("  │  muss dieselbe Root-CA auf allen Nodes vorhanden sein.           │").yellow());
+            println!("{}", style("  │                                                                  │").yellow());
+            println!("  {}  Root-CA kopieren auf anderen Node:",
+                style("│").yellow());
+            println!();
+            println!("  {}  {}",
+                style("│").yellow(),
+                style(format!("scp {} {}  user@other-node:/opt/stone-node/stone_data/tls/",
+                    ca_crt.display(), ca_key.display())).green());
+            println!();
+            println!("{}", style("  │  Danach dort stone-setup neu starten — Node-Cert wird auto.     │").yellow());
+            println!("{}", style("  │  von der gemeinsamen CA signiert.                                │").yellow());
+            println!("{}", style("  └──────────────────────────────────────────────────────────────────┘").yellow());
         }
     }
     println!();
@@ -792,6 +814,8 @@ fn print_summary(cfg: &Config) {
     kv("PSK / pnet",      if cfg.psk_enabled { "aktiviert" } else { "deaktiviert" });
     kv("API-Key",         &format!("{}…", &cfg.api_key[..12.min(cfg.api_key.len())]));
     kv("TLS",             "aktiv (Embedded-CA, auto-verwaltet)");
+    let ca_path = cfg.data_dir.join("tls/root.crt");
+    kv("Root-CA",         &ca_path.display().to_string());
     let tunnel_summary = match cfg.tunnel_mode.as_str() {
         "quick" => "Quick-Tunnel (*.trycloudflare.com)".to_string(),
         "named" => format!("Named-Tunnel → {}", cfg.tunnel_domain.as_deref().unwrap_or("?")),

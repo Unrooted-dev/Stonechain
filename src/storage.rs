@@ -24,7 +24,8 @@
 //! - Deduplizierung automatisch (gleiche Bytes → gleicher Hash → eine Datei)
 //! - Lesen, Schreiben, Existenz-Check, Größe, Aufräumen (Garbage Collection)
 
-use crate::blockchain::{Block, Document, chunk_dir, data_dir};
+use crate::blockchain::{Block, Document, chunk_dir, data_dir, ChunkRef, CHUNK_SIZE as BLOCK_CHUNK_SIZE};
+use crate::shard::{self, ShardStore};
 use bincode::config::standard;
 use rocksdb::{ColumnFamilyDescriptor, DB, Options, WriteBatch, WriteOptions};
 use sha2::{Digest, Sha256};
@@ -364,6 +365,9 @@ impl ChunkStore {
             refs.push(crate::blockchain::ChunkRef {
                 hash,
                 size: chunk.len() as u64,
+                shards: Vec::new(),
+                ec_k: 0,
+                ec_m: 0,
             });
         }
         Ok(refs)
@@ -489,18 +493,22 @@ pub struct GcResult {
 
 // ─── Kombinierter Store ───────────────────────────────────────────────────────
 
-/// Fasst ChainStore und ChunkStore zusammen.
+/// Fasst ChainStore, ChunkStore und ShardStore zusammen.
 /// Wird als `Arc<StoneStore>` in der gesamten Anwendung geteilt.
 pub struct StoneStore {
     pub chain: Arc<ChainStore>,
     pub chunks: ChunkStore,
+    pub shards: ShardStore,
 }
 
 impl StoneStore {
     pub fn open() -> Result<Arc<Self>, StorageError> {
         let chain = ChainStore::open()?;
         let chunks = ChunkStore::new()?;
-        Ok(Arc::new(Self { chain, chunks }))
+        let shards = ShardStore::new().map_err(|e| StorageError::Io(
+            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+        ))?;
+        Ok(Arc::new(Self { chain, chunks, shards }))
     }
 
     /// Sammelt alle von der aktuellen Chain referenzierten Chunk-Hashes.
@@ -522,6 +530,461 @@ impl StoneStore {
         let referenced = self.referenced_chunks()?;
         Ok(self.chunks.gc(&referenced))
     }
+
+    /// Liest Dokument-Daten — automatisch aus Chunks (Legacy) oder Shards (Erasure-Coded).
+    pub fn read_document_data(&self, doc: &Document) -> Result<Vec<u8>, StorageError> {
+        let mut data = Vec::new();
+        for chunk_ref in &doc.chunks {
+            let chunk_data = if chunk_ref.shards.is_empty() {
+                // Legacy: Full-Replication Chunk
+                self.chunks.read_chunk(&chunk_ref.hash)?
+            } else {
+                // Neu: Erasure-Coded Shards – lokale Rekonstruktion versuchen
+                self.shards
+                    .try_reconstruct_local(
+                        &chunk_ref.hash,
+                        chunk_ref.ec_k,
+                        chunk_ref.ec_m,
+                        chunk_ref.size as usize,
+                    )
+                    .map_err(|e| StorageError::NotFound(e.to_string()))?
+            };
+            data.extend_from_slice(&chunk_data);
+        }
+        Ok(data)
+    }
+
+    /// Erasure-Coded ein Dokument: Nimmt die Roh-Bytes und bestehende ChunkRefs,
+    /// encoded jeden Chunk mit Reed-Solomon, speichert alle Shards lokal,
+    /// und gibt aktualisierte ChunkRefs mit ShardRef-Infos zurück.
+    ///
+    /// Der `local_peer_id` wird als `holder` für die lokal gespeicherten Shards gesetzt.
+    ///
+    /// Parameter:
+    /// - `raw_data`: Die vollständigen Dokument-Bytes (vor oder nach Verschlüsselung)
+    /// - `chunk_refs`: Bestehende ChunkRefs (aus `write_chunks()`)
+    /// - `local_peer_id`: PeerId dieser Node (als Holder-Referenz)
+    /// - `k`: Anzahl Daten-Shards (Default: 4)
+    /// - `m`: Anzahl Parity-Shards (Default: 2)
+    pub fn erasure_code_chunks(
+        &self,
+        raw_data: &[u8],
+        chunk_refs: &[ChunkRef],
+        local_peer_id: &str,
+        k: u8,
+        m: u8,
+    ) -> Result<Vec<ChunkRef>, StorageError> {
+        let chunk_size = BLOCK_CHUNK_SIZE;
+        let mut coded_refs = Vec::with_capacity(chunk_refs.len());
+
+        for (i, chunk_ref) in chunk_refs.iter().enumerate() {
+            let start = i * chunk_size;
+            let end = (start + chunk_size).min(raw_data.len());
+            let chunk_data = &raw_data[start..end];
+
+            // Reed-Solomon Encoding
+            let shard_pieces = shard::encode_chunk(chunk_data, k as usize, m as usize)
+                .map_err(|e| StorageError::Encode(format!("Erasure-Coding Chunk {}: {e}", chunk_ref.hash)))?;
+
+            // Alle Shards lokal speichern (diese Node hält erstmal alle)
+            let shard_tuples: Vec<(u8, Vec<u8>)> = shard_pieces
+                .into_iter()
+                .enumerate()
+                .map(|(idx, data)| (idx as u8, data))
+                .collect();
+
+            let mut shard_refs = self.shards
+                .write_my_shards(&chunk_ref.hash, &shard_tuples)
+                .map_err(|e| StorageError::Io(
+                    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                ))?;
+
+            // Holder auf local_peer_id setzen
+            for sr in &mut shard_refs {
+                sr.holder = local_peer_id.to_string();
+            }
+
+            coded_refs.push(ChunkRef {
+                hash: chunk_ref.hash.clone(),
+                size: chunk_ref.size,
+                shards: shard_refs,
+                ec_k: k,
+                ec_m: m,
+            });
+        }
+
+        Ok(coded_refs)
+    }
+}
+
+// ─── Shard-Verteilung (async) ─────────────────────────────────────────────────
+
+/// Verteilt Shards eines Dokuments an verbundene Peers via P2P ShardExchange.
+///
+/// Strategie:
+/// - Holt die Liste der verbundenen Peers
+/// - Weist Shards per Round-Robin an Peers zu (assign_shards_to_peers)
+/// - Sendet jeden zugewiesenen Shard via `store_shard_on_peer()`
+/// - Wartet NICHT auf Bestätigung (fire-and-forget; Bestätigungen kommen als NetworkEvent)
+///
+/// Gibt die aktualisierten ChunkRefs zurück mit den Holder-Infos.
+pub async fn distribute_shards(
+    chunk_refs: &[ChunkRef],
+    shard_store: &ShardStore,
+    network: &crate::network::NetworkHandle,
+) -> Vec<ChunkRef> {
+    // Verbundene Peers holen
+    let peers = network.connected_peers().await;
+    if peers.is_empty() {
+        println!("[sharding] ⚠ Keine verbundenen Peers – Shards bleiben nur lokal");
+        return chunk_refs.to_vec();
+    }
+
+    let peer_ids: Vec<String> = peers.iter().map(|p| p.peer_id.clone()).collect();
+    println!(
+        "[sharding] 📤 Verteile Shards an {} Peer(s): {:?}",
+        peer_ids.len(),
+        peer_ids.iter().map(|p| &p[..8.min(p.len())]).collect::<Vec<_>>()
+    );
+
+    let mut updated_refs = Vec::with_capacity(chunk_refs.len());
+
+    for chunk_ref in chunk_refs {
+        if chunk_ref.shards.is_empty() || chunk_ref.ec_k == 0 {
+            // Nicht erasure-coded → überspringen
+            updated_refs.push(chunk_ref.clone());
+            continue;
+        }
+
+        let k = chunk_ref.ec_k;
+        let m = chunk_ref.ec_m;
+
+        // Shard-Zuweisung berechnen
+        let assignments = shard::assign_shards_to_peers(
+            &chunk_ref.hash,
+            &peer_ids,
+            k,
+            m,
+        );
+
+        let mut updated_shards = chunk_ref.shards.clone();
+
+        for (shard_index, target_peer_id) in &assignments {
+            // Shard lokal lesen
+            let shard_data = match shard_store.read_shard(&chunk_ref.hash, *shard_index) {
+                Ok(data) => data,
+                Err(e) => {
+                    eprintln!(
+                        "[sharding] ❌ Kann Shard {}[{}] nicht lesen: {e}",
+                        &chunk_ref.hash[..8], shard_index
+                    );
+                    continue;
+                }
+            };
+
+            // Shard-Hash für Integrität
+            let hash = shard::shard_hash(&shard_data);
+
+            // PeerId parsen
+            let peer_id: libp2p::PeerId = match target_peer_id.parse() {
+                Ok(id) => id,
+                Err(e) => {
+                    eprintln!("[sharding] ❌ Ungültige PeerId {target_peer_id}: {e}");
+                    continue;
+                }
+            };
+
+            println!(
+                "[sharding] → Shard {}[{}] ({} bytes) → {}",
+                &chunk_ref.hash[..8.min(chunk_ref.hash.len())],
+                shard_index,
+                shard_data.len(),
+                &target_peer_id[..8.min(target_peer_id.len())]
+            );
+
+            // An Peer senden (fire-and-forget)
+            network
+                .store_shard_on_peer(
+                    peer_id,
+                    chunk_ref.hash.clone(),
+                    *shard_index,
+                    hash,
+                    shard_data,
+                )
+                .await;
+
+            // Holder in den ShardRefs aktualisieren
+            if let Some(sr) = updated_shards
+                .iter_mut()
+                .find(|s| s.shard_index == *shard_index)
+            {
+                // Zusätzlichen Holder vermerken (Komma-getrennt)
+                if !sr.holder.is_empty() {
+                    sr.holder = format!("{},{}", sr.holder, target_peer_id);
+                } else {
+                    sr.holder = target_peer_id.clone();
+                }
+            }
+        }
+
+        updated_refs.push(ChunkRef {
+            hash: chunk_ref.hash.clone(),
+            size: chunk_ref.size,
+            shards: updated_shards,
+            ec_k: k,
+            ec_m: m,
+        });
+    }
+
+    println!(
+        "[sharding] ✅ Verteilung für {} Chunk(s) abgeschlossen",
+        updated_refs.len()
+    );
+    updated_refs
+}
+
+// ─── Shard-Download (async) ───────────────────────────────────────────────────
+
+/// Holt fehlende Shards von Peers und rekonstruiert ein Dokument.
+///
+/// Ablauf für jeden Chunk eines Dokuments:
+/// 1. Versucht lokale Rekonstruktion (try_reconstruct_local)
+/// 2. Bei Fehler: Prüft welche Shards lokal fehlen
+/// 3. Holt fehlende Shards von Peers (anhand der Holder-Infos in ShardRef)
+/// 4. Rekonstruiert mit reconstruct_with_remote()
+///
+/// Gibt die vollständigen Dokument-Bytes zurück.
+pub async fn read_document_with_remote_shards(
+    doc: &Document,
+    shard_store: &ShardStore,
+    chunk_store: &ChunkStore,
+    network: &crate::network::NetworkHandle,
+) -> Result<Vec<u8>, StorageError> {
+    let mut data = Vec::new();
+
+    for chunk_ref in &doc.chunks {
+        let chunk_data = if chunk_ref.shards.is_empty() {
+            // Legacy: kein Erasure Coding → direkt aus Chunk-Store
+            chunk_store.read_chunk(&chunk_ref.hash)?
+        } else {
+            // Erasure-Coded: Erst lokal versuchen
+            match shard_store.try_reconstruct_local(
+                &chunk_ref.hash,
+                chunk_ref.ec_k,
+                chunk_ref.ec_m,
+                chunk_ref.size as usize,
+            ) {
+                Ok(bytes) => bytes,
+                Err(local_err) => {
+                    // Lokale Rekonstruktion fehlgeschlagen → Remote-Shards holen
+                    println!(
+                        "[sharding] ⬇️ Lokale Rekonstruktion fehlgeschlagen für {}: {local_err}",
+                        &chunk_ref.hash[..8.min(chunk_ref.hash.len())]
+                    );
+
+                    let remote_shards = fetch_missing_shards_for_chunk(
+                        chunk_ref,
+                        shard_store,
+                        network,
+                    ).await;
+
+                    if remote_shards.is_empty() {
+                        return Err(StorageError::NotFound(format!(
+                            "Chunk {} nicht rekonstruierbar: keine Remote-Shards verfügbar",
+                            chunk_ref.hash
+                        )));
+                    }
+
+                    // Jetzt mit lokalen + remote Shards rekonstruieren
+                    shard_store
+                        .reconstruct_with_remote(
+                            &chunk_ref.hash,
+                            &remote_shards,
+                            chunk_ref.ec_k,
+                            chunk_ref.ec_m,
+                            chunk_ref.size as usize,
+                        )
+                        .map_err(|e| StorageError::NotFound(format!(
+                            "Rekonstruktion fehlgeschlagen für Chunk {}: {e}",
+                            chunk_ref.hash
+                        )))?
+                }
+            }
+        };
+        data.extend_from_slice(&chunk_data);
+    }
+
+    Ok(data)
+}
+
+/// Holt fehlende Shards für einen bestimmten Chunk von Peers.
+///
+/// Strategie:
+/// 1. Ermittelt welche Shard-Indices lokal fehlen
+/// 2. Für jeden fehlenden Shard: prüft die Holder-Liste in ShardRef
+/// 3. Fordert Shard von dem/den Holder-Peer(s) an
+/// 4. Wartet auf Antwort (mit Timeout)
+///
+/// Gibt eine Map shard_index → shard_data zurück.
+async fn fetch_missing_shards_for_chunk(
+    chunk_ref: &ChunkRef,
+    shard_store: &ShardStore,
+    network: &crate::network::NetworkHandle,
+) -> std::collections::HashMap<u8, Vec<u8>> {
+    use std::collections::HashMap;
+    use tokio::sync::broadcast;
+
+    let local_indices = shard_store.local_shard_indices(&chunk_ref.hash);
+    let k = chunk_ref.ec_k as usize;
+
+    // Wie viele Shards brauchen wir noch?
+    let needed = if local_indices.len() >= k {
+        return HashMap::new(); // Genug lokal!
+    } else {
+        k - local_indices.len()
+    };
+
+    println!(
+        "[sharding] 🔍 Brauche {} weitere Shard(s) für {} (lokal: {:?})",
+        needed,
+        &chunk_ref.hash[..8.min(chunk_ref.hash.len())],
+        local_indices
+    );
+
+    // Fehlende Shard-Indices bestimmen
+    let total_shards = (chunk_ref.ec_k + chunk_ref.ec_m) as u8;
+    let missing_indices: Vec<u8> = (0..total_shards)
+        .filter(|i| !local_indices.contains(i))
+        .collect();
+
+    // Event-Listener für eingehende Shards
+    let mut event_rx = network.subscribe();
+    let mut fetched: HashMap<u8, Vec<u8>> = HashMap::new();
+
+    // Shard-Anfragen senden
+    for shard_ref in &chunk_ref.shards {
+        if !missing_indices.contains(&shard_ref.shard_index) {
+            continue; // Haben wir schon lokal
+        }
+
+        // Holder kann kommagetrennt mehrere PeerIds enthalten
+        let holders: Vec<&str> = shard_ref.holder.split(',').collect();
+        for holder_id in holders {
+            let holder_id = holder_id.trim();
+            if holder_id.is_empty() || holder_id == network.local_peer_id {
+                continue;
+            }
+
+            if let Ok(peer_id) = holder_id.parse::<libp2p::PeerId>() {
+                println!(
+                    "[sharding] → Anfrage Shard {}[{}] von {}",
+                    &chunk_ref.hash[..8.min(chunk_ref.hash.len())],
+                    shard_ref.shard_index,
+                    &holder_id[..8.min(holder_id.len())]
+                );
+                network
+                    .request_shard(peer_id, chunk_ref.hash.clone(), shard_ref.shard_index)
+                    .await;
+                break; // Nur von einem Holder anfordern (retry bei nächstem Versuch)
+            }
+        }
+    }
+
+    // Fallback: Wenn keine Holder bekannt sind, alle verbundenen Peers fragen
+    if chunk_ref.shards.iter().all(|s| s.holder.is_empty()) {
+        let peers = network.connected_peers().await;
+        for missing_idx in &missing_indices {
+            if fetched.len() >= needed {
+                break;
+            }
+            for peer in &peers {
+                if let Ok(peer_id) = peer.peer_id.parse::<libp2p::PeerId>() {
+                    println!(
+                        "[sharding] → Broadcast-Anfrage Shard {}[{}] an {}",
+                        &chunk_ref.hash[..8.min(chunk_ref.hash.len())],
+                        missing_idx,
+                        &peer.peer_id[..8.min(peer.peer_id.len())]
+                    );
+                    network
+                        .request_shard(peer_id, chunk_ref.hash.clone(), *missing_idx)
+                        .await;
+                }
+            }
+        }
+    }
+
+    // Auf Antworten warten (Timeout: 10 Sekunden)
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+
+    loop {
+        if fetched.len() >= needed {
+            break;
+        }
+
+        let remaining = deadline - tokio::time::Instant::now();
+        if remaining.is_zero() {
+            eprintln!(
+                "[sharding] ⏰ Timeout: {} von {} benötigten Shards empfangen",
+                fetched.len(),
+                needed
+            );
+            break;
+        }
+
+        match tokio::time::timeout(remaining, event_rx.recv()).await {
+            Ok(Ok(crate::network::NetworkEvent::ShardReceived {
+                chunk_hash,
+                shard_index,
+                data,
+                from_peer,
+            })) if chunk_hash == chunk_ref.hash => {
+                println!(
+                    "[sharding] ← Shard {}[{}] empfangen von {} ({} bytes)",
+                    &chunk_hash[..8.min(chunk_hash.len())],
+                    shard_index,
+                    &from_peer[..8.min(from_peer.len())],
+                    data.len()
+                );
+
+                // Shard lokal cachen für zukünftige Anfragen
+                if let Err(e) = shard_store.write_shard(&chunk_hash, shard_index, &data) {
+                    eprintln!("[sharding] ⚠ Shard lokal cachen fehlgeschlagen: {e}");
+                }
+
+                fetched.insert(shard_index, data);
+            }
+            Ok(Ok(crate::network::NetworkEvent::ShardRequestFailed {
+                chunk_hash,
+                shard_index,
+                peer_id,
+                error,
+            })) if chunk_hash == chunk_ref.hash => {
+                eprintln!(
+                    "[sharding] ⚠ Shard {}[{}] von {} fehlgeschlagen: {error}",
+                    &chunk_hash[..8.min(chunk_hash.len())],
+                    shard_index,
+                    &peer_id[..8.min(peer_id.len())]
+                );
+            }
+            Ok(Ok(_)) => {
+                // Anderes Event → ignorieren, weiter warten
+                continue;
+            }
+            Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
+                eprintln!("[sharding] Event-Buffer übergelaufen ({n} verpasst)");
+                continue;
+            }
+            Ok(Err(_)) => break, // Channel geschlossen
+            Err(_) => break,     // Timeout
+        }
+    }
+
+    println!(
+        "[sharding] 📦 {} Remote-Shard(s) für {} empfangen",
+        fetched.len(),
+        &chunk_ref.hash[..8.min(chunk_ref.hash.len())]
+    );
+    fetched
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

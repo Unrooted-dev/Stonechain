@@ -10,7 +10,7 @@ use stone::{
     blockchain::{ChunkRef, data_dir, CHUNK_SIZE, Document},
     master_node::{MasterNodeState, PeerInfo, TrustEntry, TrustVote},
     network::NetworkHandle,
-    storage::ChunkStore,
+    storage::{ChunkStore, StoneStore},
 };
 
 // ─── Konstanten ──────────────────────────────────────────────────────────────
@@ -97,6 +97,24 @@ pub fn chunk_data(data: &[u8]) -> Result<Vec<ChunkRef>, String> {
 pub fn reconstruct_document_data(doc: &Document) -> Result<Vec<u8>, String> {
     let store = ChunkStore::new().map_err(|e| e.to_string())?;
     store.reconstruct_document(doc).map_err(|e| e.to_string())
+}
+
+/// Erasure-Coded einen Satz ChunkRefs:
+/// 1. Liest jeden Chunk-Inhalt
+/// 2. Reed-Solomon Encoding
+/// 3. Speichert alle Shards lokal
+/// 4. Gibt aktualisierte ChunkRefs mit ShardRef-Infos zurück
+pub fn erasure_code_document(
+    raw_data: &[u8],
+    chunk_refs: &[ChunkRef],
+    local_peer_id: &str,
+) -> Result<Vec<ChunkRef>, String> {
+    let store = StoneStore::open().map_err(|e| e.to_string())?;
+    let k = stone::shard::DEFAULT_EC_K;
+    let m = stone::shard::DEFAULT_EC_M;
+    store
+        .erasure_code_chunks(raw_data, chunk_refs, local_peer_id, k, m)
+        .map_err(|e| e.to_string())
 }
 
 // ─── Peer-Persistenz ─────────────────────────────────────────────────────────

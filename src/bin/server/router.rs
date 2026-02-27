@@ -29,7 +29,7 @@ use super::handlers::{
         handle_detect_forks, handle_list_validators, handle_remove_validator,
         handle_resolve_fork, handle_set_validator_active, handle_validator_self,
     },
-    status::{handle_health, handle_info, handle_metrics, handle_network_stats, handle_status, handle_verify},
+    status::{handle_health, handle_info, handle_metrics, handle_network_stats, handle_shard_health, handle_status, handle_verify},
     trust::{
         handle_trust_approve, handle_trust_check, handle_trust_history,
         handle_trust_pending, handle_trust_registry, handle_trust_request,
@@ -50,6 +50,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/metrics", get(handle_metrics))
         .route("/api/v1/network", get(handle_network_stats))
         .route("/api/v1/chain/verify", get(handle_verify))
+        // Shard-Health (Erasure Coding Monitoring)
+        .route("/api/v1/shards/health", get(handle_shard_health))
         // Blöcke (Admin)
         .route("/api/v1/blocks", get(handle_list_blocks))
         .route("/api/v1/blocks/:index", get(handle_get_block))

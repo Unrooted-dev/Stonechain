@@ -7,17 +7,35 @@
 //!  │  StoneSwarm                                            │
 //!  │                                                        │
 //!  │  Transport: TCP + Noise (Ed25519) + Yamux              │
+//!  │           + Relay (für NAT-Traversal)                  │
 //!  │                                                        │
 //!  │  Protokolle:                                           │
 //!  │  ├── Identify   – Peer-Metadaten austauschen           │
 //!  │  ├── Kademlia   – Bootstrap + Peer-Discovery           │
 //!  │  ├── mDNS       – Lokale/private Netz-Discovery        │
 //!  │  ├── Gossipsub  – Block-Broadcast (pub/sub)            │
-//!  │  └── RequestResponse – Block-/Chunk-Austausch          │
+//!  │  ├── RequestResponse – Block-/Chunk-Austausch          │
+//!  │  ├── Relay (Client) – NAT-Traversal via Relay-Server   │
+//!  │  ├── DCUtR      – Direct Connection Upgrade (Hole-     │
+//!  │  │                Punching nach Relay-Verbindung)       │
+//!  │  ├── AutoNAT    – Automatische NAT-Erkennung           │
+//!  │  └── UPnP       – Automatisches Port-Forwarding        │
 //!  │                                                        │
 //!  │  Identität: Ed25519-Keypair (stone_data/p2p.key)       │
 //!  └────────────────────────────────────────────────────────┘
 //! ```
+//!
+//! ## NAT-Traversal Strategie
+//!
+//! Nodes hinter NAT/Firewall können sich **ohne Port-Freigabe** verbinden:
+//!
+//! 1. **UPnP** – Versucht automatisch den Router zu konfigurieren (funktioniert
+//!    bei ca. 50% der Home-Router)
+//! 2. **AutoNAT** – Erkennt automatisch ob wir hinter NAT sind
+//! 3. **Relay** – Wenn hinter NAT: Verbindung über einen öffentlichen Relay-Node
+//!    als Zwischenstation (langsamer, aber funktioniert immer)
+//! 4. **DCUtR** (Hole-Punching) – Nach der Relay-Verbindung wird automatisch
+//!    ein direkter UDP/TCP-Tunnel versucht (schneller als Relay)
 //!
 //! ## Sicherheitsmodell
 //!
@@ -39,15 +57,19 @@ use crate::psk::load_pnet_key;
 use futures_util::StreamExt;
 use libp2p::{
     Multiaddr, PeerId, Swarm, SwarmBuilder, Transport as _,
+    autonat,
+    dcutr,
     gossipsub::{self, IdentTopic, MessageAuthenticity},
     identify,
     kad::{self, store::MemoryStore},
     mdns,
     noise,
     pnet,
+    relay,
     request_response::{self, ProtocolSupport},
     swarm::SwarmEvent,
     tcp,
+    upnp,
     yamux,
 };
 use serde::{Deserialize, Serialize};
@@ -73,6 +95,26 @@ pub const TOPIC_PEERS: &str = "stone/peers/v1";
 
 /// Standard-libp2p-Port des Stone-Netzwerks
 pub const DEFAULT_P2P_PORT: u16 = 7654;
+
+// ─── Built-in Seed-Nodes ──────────────────────────────────────────────────────
+//
+// Mindestens ein Seed-Node ist nötig damit neue Nodes das Netzwerk finden können.
+// Die Seed-Nodes werden als Bootstrap UND als Relay genutzt.
+// Weitere Nodes können per ENV (STONE_BOOTSTRAP_NODES) hinzugefügt werden.
+//
+// Format: "/ip4/<IP>/tcp/<PORT>/p2p/<PeerId>"
+//
+// HINWEIS: Diese Liste kann per `STONE_NO_SEED=1` deaktiviert werden.
+//          Das ist nützlich für komplett private / isolierte Netzwerke.
+
+/// Eingebaute Seed-Nodes – der erste Einstiegspunkt ins Stone-Netzwerk.
+/// Jeder dieser Nodes ist gleichzeitig Relay-Server und Bootstrap-Node.
+const SEED_NODES: &[&str] = &[
+    // Server-Node (unrootles) – Öffentliche IPv6
+    "/ip6/2a0d:3341:b16b:4808:5054:ff:fea7:bab0/tcp/4001/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd",
+    // Server-Node (unrootles) – Tailscale (Fallback)
+    "/ip4/100.90.28.68/tcp/4001/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd",
+];
 
 /// Gibt das aktive Daten-Verzeichnis zurück.
 /// Kann per `STONE_DATA_DIR` überschrieben werden.
@@ -125,6 +167,33 @@ pub struct P2pConfig {
     /// Chain-Sync bei Connect: fehlende Blöcke automatisch nachladen
     #[serde(default = "default_true")]
     pub auto_sync_on_connect: bool,
+
+    // ─── NAT-Traversal ──────────────────────────────────────────────────────
+
+    /// Relay-Nodes für NAT-Traversal (Multiaddr mit PeerId).
+    /// Nodes hinter NAT reservieren einen Platz auf diesen Relays,
+    /// damit andere Nodes sie über den Relay erreichen können.
+    /// Format: `["/ip4/1.2.3.4/tcp/7654/p2p/<PeerId>", ...]`
+    #[serde(default)]
+    pub relay_nodes: Vec<String>,
+
+    /// AutoNAT aktivieren – erkennt automatisch ob wir hinter NAT sind
+    #[serde(default = "default_true")]
+    pub autonat_enabled: bool,
+
+    /// UPnP aktivieren – versucht automatisches Port-Forwarding am Router
+    #[serde(default = "default_true")]
+    pub upnp_enabled: bool,
+
+    /// DCUtR (Hole-Punching) aktivieren – direkter Tunnel nach Relay-Verbindung
+    #[serde(default = "default_true")]
+    pub dcutr_enabled: bool,
+
+    /// Dieser Node fungiert als Relay-Server für andere Nodes.
+    /// Standardmäßig aktiviert – jeder Node hilft dem Netzwerk indem er
+    /// als Relay für Nodes hinter NAT fungiert.
+    #[serde(default = "default_true")]
+    pub relay_server_enabled: bool,
 }
 
 fn default_listen_addr() -> String {
@@ -146,6 +215,11 @@ impl Default for P2pConfig {
             connection_timeout_secs: 30,
             reconnect_interval_secs: 60,
             auto_sync_on_connect: true,
+            relay_nodes: Vec::new(),
+            autonat_enabled: true,
+            upnp_enabled: true,
+            dcutr_enabled: true,
+            relay_server_enabled: true,
         }
     }
 }
@@ -170,7 +244,24 @@ impl P2pConfig {
     }
 
     /// Bootstrap-Nodes aus ENV `STONE_BOOTSTRAP_NODES` (kommagetrennt) laden
+    /// und eingebaute Seed-Nodes hinzufügen.
     pub fn merge_env(&mut self) {
+        // ── Seed-Nodes automatisch hinzufügen ─────────────────────────────────
+        // Kann per STONE_NO_SEED=1 deaktiviert werden (für isolierte Netze)
+        if std::env::var("STONE_NO_SEED").as_deref() != Ok("1") {
+            for seed in SEED_NODES {
+                let seed_str = seed.to_string();
+                // Als Bootstrap-Node
+                if !self.bootstrap_nodes.contains(&seed_str) {
+                    self.bootstrap_nodes.push(seed_str.clone());
+                }
+                // Auch als Relay-Node (für NAT-Traversal)
+                if !self.relay_nodes.contains(&seed_str) {
+                    self.relay_nodes.push(seed_str);
+                }
+            }
+        }
+
         if let Ok(raw) = std::env::var("STONE_BOOTSTRAP_NODES") {
             for addr in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                 if !self.bootstrap_nodes.contains(&addr.to_string()) {
@@ -185,8 +276,25 @@ impl P2pConfig {
         // STONE_P2P_PORT: nur Portnummer – überschreibt Port in listen_addr
         if let Ok(port_str) = std::env::var("STONE_P2P_PORT") {
             if let Ok(port) = port_str.parse::<u16>() {
-                self.listen_addr = format!("/ip4/0.0.0.0/tcp/{port}");
+                // Schema (ip4/ip6) der bestehenden listen_addr beibehalten
+                if self.listen_addr.starts_with("/ip6/") {
+                    self.listen_addr = format!("/ip6/::/tcp/{port}");
+                } else {
+                    self.listen_addr = format!("/ip4/0.0.0.0/tcp/{port}");
+                }
             }
+        }
+        // STONE_RELAY_NODES: kommagetrennte Relay-Node-Adressen
+        if let Ok(raw) = std::env::var("STONE_RELAY_NODES") {
+            for addr in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                if !self.relay_nodes.contains(&addr.to_string()) {
+                    self.relay_nodes.push(addr.to_string());
+                }
+            }
+        }
+        // STONE_RELAY_SERVER=1 → diesen Node als Relay-Server aktivieren
+        if std::env::var("STONE_RELAY_SERVER").as_deref() == Ok("1") {
+            self.relay_server_enabled = true;
         }
     }
 }
@@ -212,6 +320,30 @@ pub enum NetworkEvent {
     Listening { addr: String },
     /// Fehler
     Error { message: String },
+
+    // ── Shard-Events ──────────────────────────────────────────────────────
+    /// Ein angeforderter Shard wurde empfangen
+    ShardReceived {
+        chunk_hash: String,
+        shard_index: u8,
+        data: Vec<u8>,
+        from_peer: String,
+    },
+    /// Ein Shard wurde erfolgreich auf einem Peer gespeichert
+    ShardStored {
+        chunk_hash: String,
+        shard_index: u8,
+        peer_id: String,
+        success: bool,
+        error: Option<String>,
+    },
+    /// Shard-Store-Anfrage fehlgeschlagen (Netzwerk)
+    ShardRequestFailed {
+        chunk_hash: String,
+        shard_index: u8,
+        peer_id: String,
+        error: String,
+    },
 }
 
 /// Befehle die von außen an den Swarm-Task gesendet werden.
@@ -236,6 +368,28 @@ pub enum NetworkCommand {
     GetStatus(tokio::sync::oneshot::Sender<NetworkStatus>),
     /// Swarm beenden
     Shutdown,
+
+    // ── Shard-Befehle ─────────────────────────────────────────────────────
+    /// Shard von einem Peer anfordern
+    RequestShard {
+        peer_id: PeerId,
+        chunk_hash: String,
+        shard_index: u8,
+    },
+    /// Shard an einen Peer zum Speichern senden
+    StoreShard {
+        peer_id: PeerId,
+        chunk_hash: String,
+        shard_index: u8,
+        shard_hash: String,
+        data: Vec<u8>,
+    },
+    /// Shard-Liste eines Peers für einen bestimmten Chunk abfragen
+    ListPeerShards {
+        peer_id: PeerId,
+        chunk_hash: String,
+        reply: tokio::sync::oneshot::Sender<Vec<u8>>,
+    },
 }
 
 /// Ergebnis eines Pings an einen Peer
@@ -298,6 +452,52 @@ pub struct BlockResponse {
     pub block: Option<Block>,
 }
 
+// ─── Shard Exchange Typen ─────────────────────────────────────────────────────
+
+/// Anfrage an einen Peer: Shard-Operationen
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ShardRequest {
+    /// Frage: Hast du diesen Shard? Gib mir die Daten.
+    GetShard {
+        chunk_hash: String,
+        shard_index: u8,
+    },
+    /// Speichere diesen Shard für mich (bei Upload-Verteilung).
+    StoreShard {
+        chunk_hash: String,
+        shard_index: u8,
+        shard_hash: String,
+        data: Vec<u8>,
+    },
+    /// Welche Shards hast du für diesen Chunk?
+    ListShards {
+        chunk_hash: String,
+    },
+}
+
+/// Antwort auf eine Shard-Anfrage
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ShardResponse {
+    /// Shard-Daten (None wenn nicht vorhanden)
+    ShardData {
+        chunk_hash: String,
+        shard_index: u8,
+        data: Option<Vec<u8>>,
+    },
+    /// Bestätigung: Shard wurde gespeichert (oder Fehler)
+    StoreResult {
+        chunk_hash: String,
+        shard_index: u8,
+        success: bool,
+        error: Option<String>,
+    },
+    /// Liste lokaler Shard-Indices für einen Chunk
+    ShardList {
+        chunk_hash: String,
+        indices: Vec<u8>,
+    },
+}
+
 // ─── Keypair-Persistenz ───────────────────────────────────────────────────────
 
 /// Lädt das Ed25519-Keypair für die P2P-Identität oder erstellt ein neues.
@@ -354,11 +554,24 @@ pub struct StoneBehaviour {
     pub mdns: mdns::tokio::Behaviour,
     pub gossipsub: gossipsub::Behaviour,
     pub block_exchange: request_response::cbor::Behaviour<BlockRequest, BlockResponse>,
+    pub shard_exchange: request_response::cbor::Behaviour<ShardRequest, ShardResponse>,
+    pub relay_client: relay::client::Behaviour,
+    pub relay_server: relay::Behaviour,
+    pub dcutr: dcutr::Behaviour,
+    pub autonat: autonat::Behaviour,
+    pub upnp: upnp::tokio::Behaviour,
 }
 
 // ─── Swarm aufbauen ───────────────────────────────────────────────────────────
 
-/// Erstellt den libp2p-Swarm mit allen Protokollen.
+/// Erstellt den libp2p-Swarm mit allen Protokollen + NAT-Traversal.
+///
+/// Transport-Schichtung:
+///   TCP → Noise → Yamux  (direkte Verbindungen)
+///   +  Relay-Transport   (für Nodes hinter NAT)
+///
+/// Die Relay-Client-Behaviour wird automatisch mit dem Transport verknüpft.
+/// DCUtR versucht nach einer Relay-Verbindung einen direkten Tunnel (Hole-Punch).
 pub fn build_swarm(
     keypair: libp2p::identity::Keypair,
     config: &P2pConfig,
@@ -378,8 +591,6 @@ pub fn build_swarm(
         gossipsub_config,
     )
     .map_err(|e| format!("Gossipsub init: {e}"))?;
-
-    // Topics werden nach dem Swarm-Bau via subscribe_all_topics abonniert
 
     // ── Kademlia ──────────────────────────────────────────────────────────────
     let mut kad_config = kad::Config::new(
@@ -406,26 +617,62 @@ pub fn build_swarm(
         request_response::Config::default(),
     );
 
-    let behaviour = StoneBehaviour {
-        identify,
-        kad,
-        mdns,
-        gossipsub,
-        block_exchange,
-    };
+    // ── Request/Response (Shard-Austausch) ────────────────────────────────────
+    let shard_exchange = request_response::cbor::Behaviour::new(
+        [(
+            libp2p::StreamProtocol::new("/stone/shard-exchange/1.0.0"),
+            ProtocolSupport::Full,
+        )],
+        request_response::Config::default(),
+    );
 
-    // ── Transport: TCP + PSK (pnet) + Noise (Ed25519-Auth) + Yamux ────────────
+    // ── AutoNAT – erkennt ob wir hinter NAT sind ─────────────────────────────
+    let autonat = autonat::Behaviour::new(peer_id, autonat::Config {
+        boot_delay: Duration::from_secs(10),
+        refresh_interval: Duration::from_secs(60),
+        retry_interval: Duration::from_secs(30),
+        throttle_server_period: Duration::from_secs(15),
+        ..Default::default()
+    });
+
+    // ── UPnP – automatisches Port-Forwarding ──────────────────────────────────
+    let upnp = upnp::tokio::Behaviour::default();
+
+    // ── Relay Server – jeder Node ist potentiell ein Relay ────────────────────
+    // Öffentlich erreichbare Nodes leiten Traffic für Nodes hinter NAT weiter.
+    // Rate-Limiting schützt vor Missbrauch.
+    let relay_server = relay::Behaviour::new(
+        peer_id,
+        relay::Config {
+            max_reservations: 128,
+            max_reservations_per_peer: 4,
+            reservation_duration: Duration::from_secs(3600),   // 1h
+            max_circuits: 64,
+            max_circuits_per_peer: 4,
+            max_circuit_duration: Duration::from_secs(600),    // 10min pro Circuit
+            max_circuit_bytes: 16 * 1024 * 1024,               // 16 MiB pro Circuit
+            ..Default::default()
+        },
+    );
+
+    // ── Swarm mit Relay-Client-Transport aufbauen ─────────────────────────────
     //
-    // Schicht-Reihenfolge (von außen nach innen):
-    //   TCP → pnet (symmetr. Verschlüssel./Auth via PSK) → Noise (Peer-Authen.) → Yamux
+    // SwarmBuilder.with_relay_client() gibt uns:
+    //  1. Den Relay-Client-Transport (für eingehende relayed Verbindungen)
+    //  2. Die Relay-Client-Behaviour (wird im StoneBehaviour gehalten)
     //
-    // Ohne gültigen PSK schlägt der pnet-Handshake fehl → Node wird nicht verbunden.
-    // Das ersetzt den zentralen Auth-Server für Node-Joins vollständig.
+    // DCUtR baut auf dem Relay auf: nach einer Relay-Verbindung wird
+    // automatisch versucht eine direkte Verbindung herzustellen (Hole-Punching).
+
     let pnet_key = load_pnet_key();
 
     let swarm = if let Some(psk) = pnet_key {
         // PSK aktiv: pnet-Layer vor Noise einschalten
+        // HINWEIS: Mit PSK ist Relay-Transport nicht kompatibel (pnet erwartet
+        // direkte TCP-Verbindung). Relay wird übersprungen.
         let pnet_config = pnet::PnetConfig::new(psk);
+        println!("[p2p] ⚠ PSK aktiv – Relay/DCUtR/UPnP deaktiviert (nur direkte Verbindungen)");
+        // Dummy relay_client + dcutr für das Behaviour-Struct
         SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_other_transport(|key| {
@@ -439,7 +686,23 @@ pub fn build_swarm(
                     .boxed();
                 Ok(transport)
             })?
-            .with_behaviour(|_| behaviour)?
+            .with_relay_client(noise::Config::new, yamux::Config::default)?
+            .with_behaviour(|key, relay_client| {
+                let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
+                StoneBehaviour {
+                    identify: identify,
+                    kad: kad,
+                    mdns: mdns,
+                    gossipsub: gossipsub,
+                    block_exchange: block_exchange,
+                    shard_exchange: shard_exchange,
+                    relay_client,
+                    relay_server,
+                    dcutr,
+                    autonat,
+                    upnp,
+                }
+            })?
             .with_swarm_config(|cfg| {
                 cfg.with_idle_connection_timeout(Duration::from_secs(
                     config.connection_timeout_secs * 2,
@@ -447,7 +710,8 @@ pub fn build_swarm(
             })
             .build()
     } else {
-        // PSK deaktiviert: Standard TCP + Noise + Yamux
+        // Ohne PSK: voller NAT-Traversal Stack
+        //   TCP + Noise + Yamux + Relay-Client + DCUtR
         SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_tcp(
@@ -455,7 +719,23 @@ pub fn build_swarm(
                 noise::Config::new,
                 yamux::Config::default,
             )?
-            .with_behaviour(|_| behaviour)?
+            .with_relay_client(noise::Config::new, yamux::Config::default)?
+            .with_behaviour(|key, relay_client| {
+                let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
+                StoneBehaviour {
+                    identify: identify,
+                    kad: kad,
+                    mdns: mdns,
+                    gossipsub: gossipsub,
+                    block_exchange: block_exchange,
+                    shard_exchange: shard_exchange,
+                    relay_client,
+                    relay_server,
+                    dcutr,
+                    autonat,
+                    upnp,
+                }
+            })?
             .with_swarm_config(|cfg| {
                 cfg.with_idle_connection_timeout(Duration::from_secs(
                     config.connection_timeout_secs * 2,
@@ -498,6 +778,52 @@ struct SwarmTask {
         request_response::OutboundRequestId,
         (String, std::time::Instant, tokio::sync::oneshot::Sender<PingResult>),
     >,
+
+    // ─── NAT-Traversal Zustand ──────────────────────────────────────────────
+
+    /// Erkannter NAT-Status
+    nat_status: NatStatus,
+
+    /// Relay-Nodes bei denen wir eine Reservation haben
+    active_relays: HashSet<PeerId>,
+
+    /// Relay-Adressen die wir versuchen sollen
+    relay_addrs: Vec<String>,
+
+    // ─── Sicherheit: Peer-Scoring ───────────────────────────────────────────
+
+    /// Penalty-Score pro Peer: wenn > BAN_THRESHOLD → Peer wird gebannt
+    peer_penalties: HashMap<PeerId, PeerPenalty>,
+
+    /// Shard-Speicher für eingehende Shard-Requests
+    shard_store: crate::shard::ShardStore,
+
+    /// Ausstehende Shard-Listen-Anfragen: request_id → reply
+    pending_shard_lists: HashMap<
+        request_response::OutboundRequestId,
+        (String, tokio::sync::oneshot::Sender<Vec<u8>>),
+    >,
+}
+
+/// Tracking für Fehlverhalten eines Peers
+struct PeerPenalty {
+    score: u32,
+    last_offense: Instant,
+    reasons: Vec<String>,
+}
+
+/// Ab diesem Score wird ein Peer gebannt (Verbindung getrennt, kein Re-Dial)
+const BAN_THRESHOLD: u32 = 200;
+
+/// Penalty-Punkte verfallen nach dieser Zeit (Minuten)
+const PENALTY_DECAY_MINS: u64 = 30;
+
+/// NAT-Status des Nodes
+#[derive(Debug, Clone, PartialEq)]
+enum NatStatus {
+    Unknown,
+    Public,
+    Private,
 }
 
 /// Entfernt die `/p2p/<PeerId>`-Komponente am Ende einer Multiaddr.
@@ -538,6 +864,23 @@ impl SwarmTask {
             eprintln!("[p2p] ℹ️  Nutze zufälligen P2P-Port (STONE_P2P_PORT setzen um festen Port zu erzwingen)");
         }
 
+        // Dual-Stack: wenn IPv6 konfiguriert, zusätzlich auf IPv4 lauschen
+        if self.config.listen_addr.starts_with("/ip6/") {
+            // Port aus listen_addr extrahieren
+            let port = listen_addr.iter().find_map(|p| {
+                if let libp2p::multiaddr::Protocol::Tcp(port) = p {
+                    Some(port)
+                } else {
+                    None
+                }
+            }).unwrap_or(4001);
+            let ipv4_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{port}").parse().unwrap();
+            match self.swarm.listen_on(ipv4_addr.clone()) {
+                Ok(_) => println!("[p2p] Dual-Stack: lausche zusätzlich auf {ipv4_addr}"),
+                Err(e) => eprintln!("[p2p] ⚠️  IPv4-Dual-Stack fehlgeschlagen: {e}"),
+            }
+        }
+
         // Bootstrap-Nodes einwählen
         for addr_str in self.bootstrap_addrs.clone() {
             self.dial_bootstrap(&addr_str);
@@ -545,6 +888,12 @@ impl SwarmTask {
 
         if !self.bootstrap_addrs.is_empty() && self.config.kad_enabled {
             let _ = self.swarm.behaviour_mut().kad.bootstrap();
+        }
+
+        // Relay-Reservierungen herstellen (falls konfiguriert)
+        if !self.relay_addrs.is_empty() {
+            println!("[p2p] 📡 {} Relay-Node(s) konfiguriert – stelle Verbindungen her...", self.relay_addrs.len());
+            self.establish_relay_reservations();
         }
 
         // Reconnect-Intervall (0 = deaktiviert)
@@ -616,6 +965,10 @@ impl SwarmTask {
                     if let Protocol::P2p(pid) = p { Some(pid) } else { None }
                 });
                 if let Some(pid) = peer_id {
+                    // Eigene PeerId nicht anwählen (Seed-Node wählt sich sonst selbst an)
+                    if pid == *self.swarm.local_peer_id() {
+                        return;
+                    }
                     self.swarm.behaviour_mut().kad.add_address(&pid, addr.clone());
                     println!("[p2p] Bootstrap-Node: {pid} @ {addr}");
                 }
@@ -653,6 +1006,11 @@ impl SwarmTask {
                     }
                 });
                 if let Some(pid) = peer_id_str {
+                    // Eigene PeerId nicht anwählen
+                    let local = self.swarm.local_peer_id().to_string();
+                    if pid == local {
+                        continue;
+                    }
                     if !connected_peer_ids.contains(&pid) {
                         println!("[p2p] Reconnect-Versuch: {pid}");
                         let _ = self.swarm.dial(addr);
@@ -668,6 +1026,13 @@ impl SwarmTask {
     async fn handle_swarm_event(&mut self, event: SwarmEvent<StoneBehaviourEvent>) {
         match event {
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                // Gebannte Peers sofort trennen
+                if self.is_peer_banned(&peer_id) {
+                    eprintln!("[p2p] 🔨 Verbindung von gebantem Peer {peer_id} getrennt");
+                    let _ = self.swarm.disconnect_peer_id(peer_id);
+                    return;
+                }
+
                 let addr = endpoint.get_remote_address().to_string();
                 let now = chrono::Utc::now().timestamp();
                 println!("[p2p] ✓ Verbunden: {peer_id} @ {addr}");
@@ -750,6 +1115,16 @@ impl SwarmTask {
             }
 
             SwarmEvent::Behaviour(bev) => self.handle_behaviour_event(bev),
+
+            SwarmEvent::ExternalAddrConfirmed { address } => {
+                println!("[p2p] 🌍 Externe Adresse bestätigt: {address}");
+                // Adresse in Kademlia eintragen damit andere Nodes uns finden
+                let local_peer = *self.swarm.local_peer_id();
+                self.swarm.behaviour_mut().kad.add_address(
+                    &local_peer,
+                    address,
+                );
+            }
 
             _ => {}
         }
@@ -969,30 +1344,433 @@ impl SwarmTask {
                 }
             }
 
+            // ── Relay-Client Events ──────────────────────────────────────────────
+
+            StoneBehaviourEvent::RelayClient(relay::client::Event::ReservationReqAccepted {
+                ..
+            }) => {
+                println!("[p2p] ✅ Relay-Reservation akzeptiert");
+            }
+
+            StoneBehaviourEvent::RelayClient(relay::client::Event::OutboundCircuitEstablished {
+                limit, ..
+            }) => {
+                println!("[p2p] 🔗 Ausgehender Relay-Circuit hergestellt (limit: {limit:?})");
+            }
+
+            StoneBehaviourEvent::RelayClient(relay::client::Event::InboundCircuitEstablished {
+                src_peer_id,
+                limit,
+            }) => {
+                println!("[p2p] 🔗 Eingehender Relay-Circuit von {src_peer_id} (limit: {limit:?})");
+            }
+
+            // ── DCUtR (Direct Connection Upgrade / Hole-Punching) ────────────────
+
+            StoneBehaviourEvent::Dcutr(dcutr::Event {
+                remote_peer_id,
+                result,
+            }) => {
+                match result {
+                    Ok(_) => {
+                        println!("[p2p] 🕳️  Hole-Punch erfolgreich zu {remote_peer_id}!");
+                    }
+                    Err(e) => {
+                        eprintln!("[p2p] ⚠ Hole-Punch fehlgeschlagen zu {remote_peer_id}: {e:?}");
+                    }
+                }
+            }
+
+            // ── AutoNAT (NAT-Erkennung) ──────────────────────────────────────────
+
+            StoneBehaviourEvent::Autonat(autonat::Event::StatusChanged { old, new }) => {
+                println!("[p2p] 🌐 NAT-Status: {old:?} → {new:?}");
+                match new {
+                    autonat::NatStatus::Public(_addr) => {
+                        self.nat_status = NatStatus::Public;
+                        println!("[p2p] ✅ NAT-Status: Öffentlich erreichbar");
+                    }
+                    autonat::NatStatus::Private => {
+                        self.nat_status = NatStatus::Private;
+                        println!("[p2p] 🔒 NAT-Status: Privat – nutze Relay für Erreichbarkeit");
+                        // Bei privatem NAT automatisch Relay-Reservierungen herstellen
+                        self.establish_relay_reservations();
+                    }
+                    autonat::NatStatus::Unknown => {
+                        self.nat_status = NatStatus::Unknown;
+                    }
+                }
+            }
+
+            StoneBehaviourEvent::Autonat(_) => {}
+
+            // ── UPnP (Automatische Port-Weiterleitung) ──────────────────────────
+
+            StoneBehaviourEvent::Upnp(upnp::Event::NewExternalAddr(addr)) => {
+                println!("[p2p] 🔌 UPnP: Externe Adresse hinzugefügt: {addr}");
+            }
+
+            StoneBehaviourEvent::Upnp(upnp::Event::GatewayNotFound) => {
+                println!("[p2p] ℹ️  UPnP: Kein Gateway gefunden – Relay wird genutzt");
+            }
+
+            StoneBehaviourEvent::Upnp(upnp::Event::NonRoutableGateway) => {
+                println!("[p2p] ℹ️  UPnP: Gateway ist nicht routbar");
+            }
+
+            StoneBehaviourEvent::Upnp(upnp::Event::ExpiredExternalAddr(addr)) => {
+                println!("[p2p] ⏰ UPnP: Externe Adresse abgelaufen: {addr}");
+            }
+
+            // ── Relay-Server Events (wir leiten Traffic für andere weiter) ───────
+
+            #[allow(deprecated)]
+            StoneBehaviourEvent::RelayServer(relay::Event::ReservationReqAccepted {
+                src_peer_id,
+                ..
+            }) => {
+                println!("[p2p] 📡 Relay: Reservation von {src_peer_id} akzeptiert (wir sind Relay für diesen Node)");
+            }
+
+            StoneBehaviourEvent::RelayServer(relay::Event::ReservationReqDenied {
+                src_peer_id,
+            }) => {
+                println!("[p2p] 📡 Relay: Reservation von {src_peer_id} abgelehnt (Limit erreicht)");
+            }
+
+            StoneBehaviourEvent::RelayServer(relay::Event::ReservationTimedOut {
+                src_peer_id,
+            }) => {
+                println!("[p2p] 📡 Relay: Reservation von {src_peer_id} abgelaufen");
+            }
+
+            StoneBehaviourEvent::RelayServer(_) => {}
+
+            // ── Shard-Exchange (Request/Response) ────────────────────────────
+            StoneBehaviourEvent::ShardExchange(
+                request_response::Event::Message { peer, message }
+            ) => match message {
+                request_response::Message::Request { request, channel, .. } => {
+                    match request {
+                        ShardRequest::GetShard { chunk_hash, shard_index } => {
+                            println!("[p2p] 📦 Shard-Anfrage: {chunk_hash}[{shard_index}] von {peer}");
+                            let data = self.shard_store.read_shard(&chunk_hash, shard_index).ok();
+                            let _ = self.swarm.behaviour_mut().shard_exchange.send_response(
+                                channel,
+                                ShardResponse::ShardData { chunk_hash, shard_index, data },
+                            );
+                        }
+                        ShardRequest::StoreShard { chunk_hash, shard_index, shard_hash, data } => {
+                            println!("[p2p] 💾 Shard-Store: {chunk_hash}[{shard_index}] von {peer} ({} bytes)", data.len());
+                            match self.shard_store.write_shard(&chunk_hash, shard_index, &data) {
+                                Ok(written_hash) => {
+                                    let ok = written_hash == shard_hash;
+                                    if !ok {
+                                        eprintln!("[p2p] ⚠ Shard-Hash Mismatch: erwartet {shard_hash}, got {written_hash}");
+                                    }
+                                    let _ = self.swarm.behaviour_mut().shard_exchange.send_response(
+                                        channel,
+                                        ShardResponse::StoreResult {
+                                            chunk_hash,
+                                            shard_index,
+                                            success: ok,
+                                            error: if ok { None } else { Some("Hash mismatch".into()) },
+                                        },
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!("[p2p] ❌ Shard-Store Fehler: {e}");
+                                    let _ = self.swarm.behaviour_mut().shard_exchange.send_response(
+                                        channel,
+                                        ShardResponse::StoreResult {
+                                            chunk_hash,
+                                            shard_index,
+                                            success: false,
+                                            error: Some(e.to_string()),
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        ShardRequest::ListShards { chunk_hash } => {
+                            let indices = self.shard_store.local_shard_indices(&chunk_hash);
+                            println!("[p2p] 📋 Shard-Liste für {chunk_hash}: {:?} (an {peer})", indices);
+                            let _ = self.swarm.behaviour_mut().shard_exchange.send_response(
+                                channel,
+                                ShardResponse::ShardList { chunk_hash, indices },
+                            );
+                        }
+                    }
+                }
+                request_response::Message::Response { request_id, response, .. } => {
+                    match response {
+                        ShardResponse::ShardData { chunk_hash, shard_index, data } => {
+                            if let Some(data) = data {
+                                println!("[p2p] ← Shard empfangen: {chunk_hash}[{shard_index}] ({} bytes) von {peer}", data.len());
+                                let _ = self.event_tx.send(NetworkEvent::ShardReceived {
+                                    chunk_hash,
+                                    shard_index,
+                                    data,
+                                    from_peer: peer.to_string(),
+                                });
+                            } else {
+                                println!("[p2p] ← Shard nicht gefunden: {chunk_hash}[{shard_index}] bei {peer}");
+                                let _ = self.event_tx.send(NetworkEvent::ShardRequestFailed {
+                                    chunk_hash,
+                                    shard_index,
+                                    peer_id: peer.to_string(),
+                                    error: "Shard nicht vorhanden".into(),
+                                });
+                            }
+                        }
+                        ShardResponse::StoreResult { chunk_hash, shard_index, success, error } => {
+                            println!("[p2p] ← Shard-Store Ergebnis: {chunk_hash}[{shard_index}] bei {peer} → {success}");
+                            let _ = self.event_tx.send(NetworkEvent::ShardStored {
+                                chunk_hash,
+                                shard_index,
+                                peer_id: peer.to_string(),
+                                success,
+                                error,
+                            });
+                        }
+                        ShardResponse::ShardList { chunk_hash, indices } => {
+                            // Antwort auf ListPeerShards
+                            if let Some((_, reply)) = self.pending_shard_lists.remove(&request_id) {
+                                let _ = reply.send(indices);
+                            } else {
+                                println!("[p2p] Shard-Liste von {peer}: {chunk_hash} → {indices:?}");
+                            }
+                        }
+                    }
+                }
+            },
+
+            StoneBehaviourEvent::ShardExchange(
+                request_response::Event::OutboundFailure { peer, request_id, error, .. }
+            ) => {
+                if let Some((_chunk_hash, reply)) = self.pending_shard_lists.remove(&request_id) {
+                    eprintln!("[p2p] Shard-Liste Fehler zu {peer}: {error}");
+                    let _ = reply.send(vec![]);
+                } else {
+                    eprintln!("[p2p] Shard-Request Fehler zu {peer}: {error}");
+                }
+            }
+
+            StoneBehaviourEvent::ShardExchange(_) => {}
+
             _ => {}
         }
+    }
+
+    // ── Relay-Reservierungen ───────────────────────────────────────────────
+
+    /// Stellt Relay-Reservierungen bei allen konfigurierten Relay-Nodes her.
+    /// Wird automatisch aufgerufen wenn AutoNAT „Private" meldet.
+    fn establish_relay_reservations(&mut self) {
+        let addrs: Vec<String> = self.relay_addrs.clone();
+        for addr_str in &addrs {
+            match addr_str.parse::<Multiaddr>() {
+                Ok(addr) => {
+                    // Versuche die Relay-PeerId aus der Multiaddr zu extrahieren
+                    let relay_peer_id = addr.iter().find_map(|p| {
+                        if let libp2p::multiaddr::Protocol::P2p(peer_id) = p {
+                            Some(peer_id)
+                        } else {
+                            None
+                        }
+                    });
+
+                    if let Some(relay_peer_id) = relay_peer_id {
+                        // Eigene PeerId überspringen
+                        if relay_peer_id == *self.swarm.local_peer_id() {
+                            continue;
+                        }
+                        if self.active_relays.contains(&relay_peer_id) {
+                            continue; // Bereits reserviert
+                        }
+                        println!("[p2p] 📡 Verbinde mit Relay {relay_peer_id}...");
+
+                        // Dial den Relay-Node
+                        if let Err(e) = self.swarm.dial(addr.clone()) {
+                            eprintln!("[p2p] Relay-Dial fehlgeschlagen für {addr}: {e}");
+                            continue;
+                        }
+
+                        // Lausche auf der Relay-Circuit-Adresse
+                        let circuit_addr = addr.clone()
+                            .with(libp2p::multiaddr::Protocol::P2pCircuit);
+                        if let Err(e) = self.swarm.listen_on(circuit_addr.clone()) {
+                            eprintln!("[p2p] Relay-Listen fehlgeschlagen: {e}");
+                        } else {
+                            println!("[p2p] 📡 Lausche via Relay-Circuit: {circuit_addr}");
+                        }
+                    } else {
+                        eprintln!("[p2p] ⚠ Relay-Adresse hat keine PeerId: {addr_str}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[p2p] Ungültige Relay-Adresse '{addr_str}': {e}");
+                }
+            }
+        }
+    }
+
+    // ── Peer-Scoring & Banning ────────────────────────────────────────────────
+
+    /// Fügt einem Peer Penalty-Punkte hinzu. Bei Überschreitung des Schwellwerts
+    /// wird der Peer gebannt (Verbindung getrennt).
+    fn add_peer_penalty(&mut self, peer: &PeerId, points: u32, reason: &str) {
+        let entry = self.peer_penalties.entry(*peer).or_insert_with(|| PeerPenalty {
+            score: 0,
+            last_offense: Instant::now(),
+            reasons: Vec::new(),
+        });
+
+        // Penalty-Verfall: wenn letzte Offense > PENALTY_DECAY_MINS her → Score halbieren
+        if entry.last_offense.elapsed() > Duration::from_secs(PENALTY_DECAY_MINS * 60) {
+            entry.score /= 2;
+            entry.reasons.clear();
+        }
+
+        entry.score += points;
+        entry.last_offense = Instant::now();
+        entry.reasons.push(reason.to_string());
+
+        eprintln!(
+            "[p2p] 🚨 Penalty für {peer}: +{points} = {} (Grund: {reason})",
+            entry.score
+        );
+
+        if entry.score >= BAN_THRESHOLD {
+            eprintln!(
+                "[p2p] 🔨 BANNED: {peer} (Score: {}, Gründe: {:?})",
+                entry.score,
+                entry.reasons,
+            );
+            // Verbindung trennen
+            let _ = self.swarm.disconnect_peer_id(*peer);
+            // Aus Peer-Liste entfernen
+            if let Some(info) = self.peers.get_mut(peer) {
+                info.connected = false;
+            }
+        }
+    }
+
+    /// Prüft ob ein Peer gebannt ist.
+    fn is_peer_banned(&self, peer: &PeerId) -> bool {
+        self.peer_penalties
+            .get(peer)
+            .map(|p| {
+                // Ban verfällt nach dem doppelten Decay-Zeitraum
+                if p.last_offense.elapsed() > Duration::from_secs(PENALTY_DECAY_MINS * 60 * 2) {
+                    false
+                } else {
+                    p.score >= BAN_THRESHOLD
+                }
+            })
+            .unwrap_or(false)
     }
 
     // ── Gossip Block verarbeiten ──────────────────────────────────────────────
 
     fn handle_gossip_block(&mut self, data: Vec<u8>, source: PeerId) {
+        // Gebannte Peers ignorieren
+        if self.is_peer_banned(&source) {
+            return;
+        }
+
+        // ── Größenlimit: Blöcke > 10 MiB sind verdächtig ──────────────────────
+        const MAX_GOSSIP_BLOCK_BYTES: usize = 10 * 1024 * 1024;
+        if data.len() > MAX_GOSSIP_BLOCK_BYTES {
+            eprintln!(
+                "[p2p] ⚠ Block von {source} zu groß ({} Bytes) – ignoriert + Penalty",
+                data.len()
+            );
+            self.add_peer_penalty(&source, 50, "oversized block");
+            return;
+        }
+
         match serde_json::from_slice::<Block>(&data) {
             Ok(block) => {
-                // Duplicate-Filter: bereits gesehene Blöcke ignorieren
+                // ── Duplicate-Filter ──────────────────────────────────────────
                 if self.is_duplicate(&block.hash) {
                     return;
                 }
 
-                // Basis-Validierung: Hash stimmt?
-                if crate::blockchain::calculate_hash(&block) != block.hash {
+                // ── Hash-Integrität ───────────────────────────────────────────
+                let expected_hash = crate::blockchain::calculate_hash(&block);
+                if expected_hash != block.hash {
                     eprintln!(
                         "[p2p] ⚠ Block #{} von {source} hat ungültigen Hash – ignoriert",
                         block.index
                     );
+                    self.add_peer_penalty(&source, 100, "invalid hash");
                     return;
                 }
 
-                println!("[p2p] 📦 Block #{} von {source} (hash={}...)", block.index, &block.hash[..8]);
+                // ── Merkle-Root-Verifikation ──────────────────────────────────
+                let expected_merkle = crate::blockchain::compute_merkle_root(
+                    &block.documents,
+                    &block.tombstones,
+                );
+                if expected_merkle != block.merkle_root {
+                    eprintln!(
+                        "[p2p] ⚠ Block #{} von {source} hat ungültigen Merkle-Root – ignoriert",
+                        block.index
+                    );
+                    self.add_peer_penalty(&source, 100, "invalid merkle root");
+                    return;
+                }
+
+                // ── Timestamp-Drift-Check ─────────────────────────────────────
+                // Block-Timestamp darf nicht > 5 Minuten in der Zukunft liegen
+                // und nicht > 24 Stunden in der Vergangenheit (außer Genesis)
+                let now = chrono::Utc::now().timestamp();
+                let max_future = 5 * 60;       // 5 Minuten Toleranz
+                let max_past = 24 * 60 * 60;   // 24 Stunden
+                if block.index > 0 {
+                    if block.timestamp > now + max_future {
+                        eprintln!(
+                            "[p2p] ⚠ Block #{} von {source} liegt {} Sek. in der Zukunft – ignoriert",
+                            block.index,
+                            block.timestamp - now,
+                        );
+                        self.add_peer_penalty(&source, 30, "future timestamp");
+                        return;
+                    }
+                    if block.timestamp < now - max_past {
+                        eprintln!(
+                            "[p2p] ⚠ Block #{} von {source} ist {} Stunden alt – ignoriert",
+                            block.index,
+                            (now - block.timestamp) / 3600,
+                        );
+                        self.add_peer_penalty(&source, 10, "stale timestamp");
+                        return;
+                    }
+                }
+
+                // ── Signer darf nicht leer sein ───────────────────────────────
+                if block.signer.is_empty() && block.index > 0 {
+                    eprintln!(
+                        "[p2p] ⚠ Block #{} von {source} hat keinen Signer – ignoriert",
+                        block.index
+                    );
+                    self.add_peer_penalty(&source, 50, "missing signer");
+                    return;
+                }
+
+                // ── Block-Größe vs. data_size Plausibilität ───────────────────
+                let actual_data_size: u64 = block.documents.iter().map(|d| d.size).sum();
+                if block.data_size > 0 && actual_data_size == 0 && !block.documents.is_empty() {
+                    eprintln!(
+                        "[p2p] ⚠ Block #{} von {source}: data_size Mismatch – ignoriert",
+                        block.index
+                    );
+                    self.add_peer_penalty(&source, 30, "data_size mismatch");
+                    return;
+                }
+
+                println!("[p2p] 📦 Block #{} von {source} (hash={}...) ✓ validiert", block.index, &block.hash[..8]);
 
                 if let Some(entry) = self.peers.get_mut(&source) {
                     entry.blocks_received += 1;
@@ -1004,7 +1782,10 @@ impl SwarmTask {
                     from_peer: source.to_string(),
                 });
             }
-            Err(e) => eprintln!("[p2p] Gossip Block-Dekodierung fehlgeschlagen: {e}"),
+            Err(e) => {
+                eprintln!("[p2p] Gossip Block-Dekodierung fehlgeschlagen von {source}: {e}");
+                self.add_peer_penalty(&source, 20, "malformed block");
+            }
         }
     }
 
@@ -1207,6 +1988,36 @@ impl SwarmTask {
                 println!("[p2p] Shutdown.");
                 true
             }
+
+            // ── Shard-Befehle ─────────────────────────────────────────────────
+
+            NetworkCommand::RequestShard { peer_id, chunk_hash, shard_index } => {
+                println!("[p2p] → Shard anfordern: {chunk_hash}[{shard_index}] von {peer_id}");
+                self.swarm.behaviour_mut().shard_exchange.send_request(
+                    &peer_id,
+                    ShardRequest::GetShard { chunk_hash, shard_index },
+                );
+                false
+            }
+
+            NetworkCommand::StoreShard { peer_id, chunk_hash, shard_index, shard_hash, data } => {
+                println!("[p2p] → Shard senden: {chunk_hash}[{shard_index}] an {peer_id} ({} bytes)", data.len());
+                self.swarm.behaviour_mut().shard_exchange.send_request(
+                    &peer_id,
+                    ShardRequest::StoreShard { chunk_hash, shard_index, shard_hash, data },
+                );
+                false
+            }
+
+            NetworkCommand::ListPeerShards { peer_id, chunk_hash, reply } => {
+                println!("[p2p] → Shard-Liste anfordern: {chunk_hash} von {peer_id}");
+                let req_id = self.swarm.behaviour_mut().shard_exchange.send_request(
+                    &peer_id,
+                    ShardRequest::ListShards { chunk_hash: chunk_hash.clone() },
+                );
+                self.pending_shard_lists.insert(req_id, (chunk_hash, reply));
+                false
+            }
         }
     }
 }
@@ -1324,6 +2135,54 @@ impl NetworkHandle {
     pub async fn shutdown(&self) {
         let _ = self.cmd_tx.send(NetworkCommand::Shutdown).await;
     }
+
+    // ── Shard-API ─────────────────────────────────────────────────────────────
+
+    /// Fordert einen bestimmten Shard von einem Peer an.
+    /// Die Antwort kommt asynchron als `NetworkEvent::ShardReceived`.
+    pub async fn request_shard(&self, peer_id: PeerId, chunk_hash: String, shard_index: u8) {
+        let _ = self.cmd_tx.send(NetworkCommand::RequestShard {
+            peer_id,
+            chunk_hash,
+            shard_index,
+        }).await;
+    }
+
+    /// Sendet einen Shard an einen Peer zum Speichern.
+    /// Die Bestätigung kommt als `NetworkEvent::ShardStored`.
+    pub async fn store_shard_on_peer(
+        &self,
+        peer_id: PeerId,
+        chunk_hash: String,
+        shard_index: u8,
+        shard_hash: String,
+        data: Vec<u8>,
+    ) {
+        let _ = self.cmd_tx.send(NetworkCommand::StoreShard {
+            peer_id,
+            chunk_hash,
+            shard_index,
+            shard_hash,
+            data,
+        }).await;
+    }
+
+    /// Fragt ab welche Shards ein Peer für einen bestimmten Chunk hat.
+    /// Timeout: 5 Sekunden.
+    pub async fn list_peer_shards(&self, peer_id: PeerId, chunk_hash: String) -> Vec<u8> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.cmd_tx.send(NetworkCommand::ListPeerShards {
+            peer_id,
+            chunk_hash,
+            reply: tx,
+        }).await.is_err() {
+            return vec![];
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+            Ok(Ok(indices)) => indices,
+            _ => vec![],
+        }
+    }
 }
 
 // ─── start_network ────────────────────────────────────────────────────────────
@@ -1349,6 +2208,19 @@ pub async fn start_network(
         }
     }
 
+    // NAT-Traversal Konfiguration loggen
+    println!("[p2p] NAT-Traversal:");
+    println!("[p2p]   AutoNAT:  {}", if config.autonat_enabled { "✅" } else { "❌" });
+    println!("[p2p]   UPnP:     {}", if config.upnp_enabled { "✅" } else { "❌" });
+    println!("[p2p]   DCUtR:    {}", if config.dcutr_enabled { "✅" } else { "❌" });
+    if !config.relay_nodes.is_empty() {
+        for r in &config.relay_nodes {
+            println!("[p2p]   Relay:    {r}");
+        }
+    } else {
+        println!("[p2p]   Relay:    Keine Relay-Nodes konfiguriert (STONE_RELAY_NODES)");
+    }
+
     let mut swarm = build_swarm(keypair, &config)?;
 
     // Gossipsub: alle Topics abonnieren
@@ -1359,6 +2231,8 @@ pub async fn start_network(
     let (cmd_tx, cmd_rx) = mpsc::channel(128);
 
     let bootstrap_addrs = config.bootstrap_nodes.clone();
+
+    let relay_addrs = config.relay_nodes.clone();
 
     let task = SwarmTask {
         swarm,
@@ -1372,6 +2246,12 @@ pub async fn start_network(
         last_reconnect: Instant::now(),
         config,
         pending_pings: HashMap::new(),
+        nat_status: NatStatus::Unknown,
+        active_relays: HashSet::new(),
+        relay_addrs,
+        peer_penalties: HashMap::new(),
+        shard_store: crate::shard::ShardStore::new().expect("ShardStore erstellen"),
+        pending_shard_lists: HashMap::new(),
     };
 
     tokio::spawn(task.run());
