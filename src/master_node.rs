@@ -846,10 +846,16 @@ pub struct DocumentResponse {
 
 impl From<&crate::blockchain::Document> for DocumentResponse {
     fn from(d: &crate::blockchain::Document) -> Self {
+        // Korrigiere generische content_types anhand der Dateiendung im Titel
+        let content_type = if d.content_type == "application/octet-stream" {
+            guess_content_type_from_title(&d.title)
+        } else {
+            d.content_type.clone()
+        };
         DocumentResponse {
             doc_id: d.doc_id.clone(),
             title: d.title.clone(),
-            content_type: d.content_type.clone(),
+            content_type,
             tags: d.tags.clone(),
             metadata: d.metadata.0.clone(),
             version: d.version,
@@ -859,6 +865,32 @@ impl From<&crate::blockchain::Document> for DocumentResponse {
             chunks_count: d.chunks.len(),
         }
     }
+}
+
+/// Leitet den MIME-Type aus dem Dateinamen ab (Extension-basiert).
+fn guess_content_type_from_title(title: &str) -> String {
+    let lower = title.to_lowercase();
+    let ext = lower.rsplit('.').next().unwrap_or("");
+    match ext {
+        "pdf"              => "application/pdf",
+        "doc"              => "application/msword",
+        "docx"             => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls"              => "application/vnd.ms-excel",
+        "xlsx"             => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "txt" | "log" | "md" | "csv" => "text/plain",
+        "html" | "htm"     => "text/html",
+        "json"             => "application/json",
+        "xml"              => "application/xml",
+        "png"              => "image/png",
+        "jpg" | "jpeg"     => "image/jpeg",
+        "gif"              => "image/gif",
+        "svg"              => "image/svg+xml",
+        "webp"             => "image/webp",
+        "mp4"              => "video/mp4",
+        "zip"              => "application/zip",
+        _                  => "application/octet-stream",
+    }
+    .to_string()
 }
 
 /// Node-Status-Antwort für `/api/v1/status`

@@ -1,21 +1,25 @@
-//! stone-setup — Interaktiver Setup-Wizard
+//! stone-setup — Interaktiver Setup-Wizard (Streamlined)
 //!
-//! Führt beim ersten Start (oder auf Wunsch) durch alle nötigen Konfigurationsschritte:
-//!   0.  TLS-Bootstrap (automatisch, vor dem Wizard — keine Eingabe nötig)
-//!   1.  Data-Directory wählen / anlegen
-//!   2.  HTTP-Port festlegen
-//!   3.  Node-Name vergeben
-//!   4.  Max. Storage (GB) konfigurieren
-//!   5.  Bootstrap-Peers auswählen / eigene eingeben
-//!   6.  P2P-Port + PSK-Modus wählen
-//!   7.  Admin API-Key generieren
-//!   8.  .env schreiben (TLS immer aktiv — Zertifikate automatisch verwaltet)
-//!   9.  Initialer Ping / Sync-Check gegen Bootstrap-Nodes
-//!  10.  Zusammenfassung + optionaler Node-Start
+//! Beim **ersten Start** (keine .env vorhanden):
+//!   1. Node-Name eingeben (oder Hostname übernehmen)
+//!   2. Seed-Peers eingeben (Multiaddr von bestehenden Nodes)
+//!   → Alles andere wird automatisch generiert:
+//!     - Admin API-Key
+//!     - P2P-Keypair
+//!     - Ports (8080 HTTP, 4001 P2P)
+//!     - .env Datei
+//!   → Node wird gestartet, verbindet sich, holt Peer-Liste, fertig.
+//!
+//! Bei **weiteren Starts** (.env vorhanden):
+//!   - 🚀 Direkt starten
+//!   - 🔧 Konfiguration anpassen (einzelne Werte ändern)
+//!   - 🔄 Komplett neu konfigurieren (Wizard erneut)
+//!   - ❌ Beenden
 
 use std::{
     collections::HashSet,
     fs,
+    net::TcpStream,
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -23,39 +27,31 @@ use std::{
 
 use console::{style, Term};
 use dialoguer::{
-    theme::ColorfulTheme, Confirm, FuzzySelect, Input, MultiSelect, Password,
+    theme::ColorfulTheme, Confirm, FuzzySelect, Input, MultiSelect,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::Rng;
-use stone::auth::{bootstrap_tls, TlsBootstrapStatus};
 
-// ─── Vordefinierte Bootstrap-Nodes ──────────────────────────────────────────
+// ─── Vordefinierte Seed-Nodes ────────────────────────────────────────────────
 
-const BOOTSTRAP_NODES: &[(&str, &str)] = &[
-    ("stone-boot-1  (Frankfurt)", "http://boot1.stonechain.network:8080"),
-    ("stone-boot-2  (Amsterdam)", "http://boot2.stonechain.network:8080"),
-    ("stone-boot-3  (Zürich)",    "http://boot3.stonechain.network:8080"),
-    ("stone-boot-4  (London)",    "http://boot4.stonechain.network:8080"),
-    ("stone-boot-5  (Stockholm)", "http://boot5.stonechain.network:8080"),
-    ("Eigene Adresse eingeben…",  "__custom__"),
+const WELL_KNOWN_SEEDS: &[(&str, &str)] = &[
+    (
+        "stone-seed-1  (unrootles / Tailscale)",
+        "/ip4/100.90.28.68/tcp/4001/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd",
+    ),
 ];
 
-// ─── Hilfs-Typen ─────────────────────────────────────────────────────────────
+// ─── Config-Struct ───────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 struct Config {
-    data_dir:        PathBuf,
-    http_port:       u16,
-    node_name:       String,
-    max_storage_gb:  u32,
-    bootstrap_peers: Vec<String>,
-    p2p_port:        u16,
-    psk_enabled:     bool,
-    psk_secret:      Option<String>,
-    api_key:         String,
-    tunnel_mode:     String,           // "quick" | "named" | "off"
-    tunnel_token:    Option<String>,
-    tunnel_domain:   Option<String>,
+    data_dir:       PathBuf,
+    http_port:      u16,
+    node_name:      String,
+    max_storage_gb: u32,
+    seed_peers:     Vec<String>,
+    p2p_port:       u16,
+    api_key:        String,
 }
 
 // ─── Einstiegspunkt ──────────────────────────────────────────────────────────
@@ -68,111 +64,181 @@ fn main() {
 
     let env_exists = Path::new(".env").exists();
 
-    // ── TLS Bootstrap (still before wizard) ──────────────────────────────────
-    // Determine data_dir from existing .env, or use the default
-    let boot_data_dir = if env_exists {
-        let content = fs::read_to_string(".env").unwrap_or_default();
-        content
-            .lines()
-            .find(|l| l.starts_with("STONE_DATA_DIR="))
-            .and_then(|l| l.splitn(2, '=').nth(1))
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("./stone_data"))
+    if env_exists {
+        handle_existing_config();
     } else {
-        PathBuf::from("./stone_data")
-    };
-
-    {
-        let pb = ProgressBar::new_spinner();
-        pb.set_style(ProgressStyle::with_template("{spinner:.cyan} {msg}").unwrap());
-        pb.set_message("TLS-Zertifikate werden geprüft…");
-        pb.enable_steady_tick(Duration::from_millis(80));
-
-        let tls_result = bootstrap_tls(&boot_data_dir);
-        match &tls_result {
-            Ok(TlsBootstrapStatus::Created) => pb.finish_with_message(format!(
-                "{} TLS bereit — Root-CA + Node-Zertifikat neu erstellt ({})",
-                style("✓").green(),
-                style(boot_data_dir.join("tls/node.crt").display().to_string()).cyan()
-            )),
-            Ok(TlsBootstrapStatus::Renewed) => pb.finish_with_message(format!(
-                "{} TLS bereit — Zertifikat erneuert ({})",
-                style("✓").green(),
-                style(boot_data_dir.join("tls/node.crt").display().to_string()).cyan()
-            )),
-            Ok(TlsBootstrapStatus::Reused) => pb.finish_with_message(format!(
-                "{} TLS bereit — bestehendes Zertifikat gültig",
-                style("✓").green()
-            )),
-            Err(e) => {
-                pb.finish_with_message(format!(
-                    "{} TLS-Bootstrap Warnung: {e} (Node läuft weiter im HTTP-Modus)",
-                    style("!").yellow()
-                ));
-            }
-        }
-        // Cluster-Hinweis: Root-CA für andere Nodes bereitstellen
-        if matches!(tls_result, Ok(TlsBootstrapStatus::Created)) {
-            let ca_crt = boot_data_dir.join("tls/root.crt");
-            let ca_key = boot_data_dir.join("tls/root.key");
-            println!();
-            println!("{}", style("  ┌─ Cluster-Setup ─────────────────────────────────────────────────┐").yellow());
-            println!("{}", style("  │  Neue Root-CA erstellt. Für HTTPS/WSS zwischen mehreren Nodes   │").yellow());
-            println!("{}", style("  │  muss dieselbe Root-CA auf allen Nodes vorhanden sein.           │").yellow());
-            println!("{}", style("  │                                                                  │").yellow());
-            println!("  {}  Root-CA kopieren auf anderen Node:",
-                style("│").yellow());
-            println!();
-            println!("  {}  {}",
-                style("│").yellow(),
-                style(format!("scp {} {}  user@other-node:/opt/stone-node/stone_data/tls/",
-                    ca_crt.display(), ca_key.display())).green());
-            println!();
-            println!("{}", style("  │  Danach dort stone-setup neu starten — Node-Cert wird auto.     │").yellow());
-            println!("{}", style("  │  von der gemeinsamen CA signiert.                                │").yellow());
-            println!("{}", style("  └──────────────────────────────────────────────────────────────────┘").yellow());
-        }
-    }
-    println!();
-
-    // ── Startmenü ─────────────────────────────────────────────────────────────
-    let choice = if env_exists {
-        // .env vorhanden → drei Optionen anbieten
-        show_existing_config_summary();
-
-        let options = &[
-            "🚀  Node direkt starten  (bestehende Konfiguration verwenden)",
-            "🔧  Neu konfigurieren    (Setup-Wizard erneut durchlaufen)",
-            "📋  Konfiguration anzeigen & starten",
-            "❌  Beenden",
-        ];
-        FuzzySelect::with_theme(&ColorfulTheme::default())
-            .with_prompt("Was möchtest du tun?")
-            .items(options)
-            .default(0)
-            .interact()
-            .unwrap_or(3)
-    } else {
-        // Erste Installation → direkt in den Wizard
         println!(
-            "{} Keine .env gefunden – Setup-Wizard wird gestartet.\n",
+            "{} Willkommen! Keine Konfiguration gefunden — Setup-Wizard wird gestartet.\n",
             style("ℹ").cyan()
         );
-        1 // → Neu konfigurieren
+        run_first_time_wizard();
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ERSTER START — Minimaler Wizard (nur Node-Name + Seed-Peers)
+// ═════════════════════════════════════════════════════════════════════════════
+
+fn run_first_time_wizard() {
+    println!(
+        "{}",
+        style("  Du musst nur 2 Dinge angeben — alles andere wird automatisch eingerichtet.")
+            .dim()
+    );
+    println!();
+
+    // ── Schritt 1: Node-Name ──────────────────────────────────────────────────
+    section("1 / 2", "Node-Name");
+    println!(
+        "{}",
+        style("  Der Name identifiziert deinen Node im Netzwerk.").dim()
+    );
+    println!();
+
+    let default_name = hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_else(|| "stone-node".into());
+
+    let node_name: String = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("Node-Name")
+        .default(default_name)
+        .interact_text()
+        .unwrap();
+    println!(
+        "{} Node-Name: {}",
+        style("✓").green(),
+        style(&node_name).cyan()
+    );
+
+    // ── Schritt 2: Seed-Peers ─────────────────────────────────────────────────
+    section("2 / 2", "Seed-Peers (Netzwerk-Einstieg)");
+    println!(
+        "{}",
+        style("  Wähle mindestens einen Seed-Node um dem Netzwerk beizutreten.").dim()
+    );
+    println!(
+        "{}",
+        style("  Die Peer-Liste wird danach automatisch vom Netzwerk synchronisiert.").dim()
+    );
+    println!();
+
+    let seed_peers = select_seed_peers();
+
+    // ── Alles andere automatisch generieren ───────────────────────────────────
+    println!();
+    println!(
+        "{}",
+        style("  ── Automatische Konfiguration ──────────────────────────────────────")
+            .cyan()
+            .bold()
+    );
+    println!();
+
+    let data_dir = PathBuf::from("./stone_data");
+    let http_port: u16 = 8080;
+    let p2p_port: u16 = 4001;
+    let max_storage_gb: u32 = 0; // unbegrenzt
+    let api_key = format!("sk_{}", generate_hex(32));
+
+    fs::create_dir_all(&data_dir).unwrap_or_else(|e| {
+        eprintln!(
+            "{} Verzeichnis konnte nicht erstellt werden: {e}",
+            style("✗").red()
+        );
+        std::process::exit(1);
+    });
+
+    auto_step("Data-Directory", &format!("{}", data_dir.display()));
+    auto_step("HTTP-Port", &http_port.to_string());
+    auto_step("P2P-Port", &p2p_port.to_string());
+    auto_step("Speicher", "unbegrenzt");
+    auto_step("PSK/pnet", "deaktiviert (offenes Netzwerk)");
+    auto_step("API-Key", &format!("{}…", &api_key[..14]));
+
+    let config = Config {
+        data_dir,
+        http_port,
+        node_name,
+        max_storage_gb,
+        seed_peers,
+        p2p_port,
+        api_key,
     };
+
+    // ── .env schreiben ────────────────────────────────────────────────────────
+    write_env(&config);
+
+    // ── Zusammenfassung ───────────────────────────────────────────────────────
+    print_summary(&config);
+
+    // ── Erreichbarkeit prüfen ─────────────────────────────────────────────────
+    if !config.seed_peers.is_empty() {
+        println!();
+        check_seed_peers(&config.seed_peers);
+    }
+
+    // ── Node starten ──────────────────────────────────────────────────────────
+    println!();
+    let info_text = if config.seed_peers.is_empty() {
+        "Node startet im Standalone-Modus (keine Seed-Peers)."
+    } else {
+        "Node startet, verbindet sich mit dem Netzwerk und synchronisiert die Peer-Liste automatisch."
+    };
+    println!("{} {}", style("ℹ").cyan(), style(info_text).dim());
+    println!();
+
+    let start = Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt("Node jetzt starten?")
+        .default(true)
+        .interact()
+        .unwrap_or(false);
+
+    if start {
+        launch_node();
+    } else {
+        print_manual_start_hint();
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// BESTEHENDE CONFIG — Menü mit Optionen
+// ═════════════════════════════════════════════════════════════════════════════
+
+fn handle_existing_config() {
+    show_existing_config_summary();
+
+    let options = &[
+        "🚀  Node direkt starten",
+        "🔧  Konfiguration anpassen",
+        "🔄  Komplett neu konfigurieren (Wizard)",
+        "📋  Konfiguration anzeigen",
+        "❌  Beenden",
+    ];
+    let choice = FuzzySelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("Was möchtest du tun?")
+        .items(options)
+        .default(0)
+        .interact()
+        .unwrap_or(4);
 
     match choice {
         0 => {
-            // Direkt starten
             println!(
                 "\n{} Bestehende Konfiguration wird verwendet.",
                 style("✓").green()
             );
             launch_node();
-            return;
         }
+        1 => adjust_config(),
         2 => {
-            // Anzeigen + starten
+            println!(
+                "\n{} Bestehende .env wird überschrieben.\n",
+                style("ℹ").cyan()
+            );
+            run_first_time_wizard();
+        }
+        3 => {
             show_full_env();
             println!();
             let go = Confirm::with_theme(&ColorfulTheme::default())
@@ -183,373 +249,270 @@ fn main() {
             if go {
                 launch_node();
             }
-            return;
-        }
-        3 | _ if choice == 3 => {
-            println!("\n{} Abgebrochen.", style("ℹ").dim());
-            return;
         }
         _ => {
-            // choice == 1 → Wizard durchlaufen (fall-through)
+            println!("\n{} Abgebrochen.", style("ℹ").dim());
         }
     }
+}
 
-    // ── Schritt 1: Data-Directory ─────────────────────────────────────────────
-    section("1 / 7", "Data-Directory");
-    let data_dir: String = Input::with_theme(&ColorfulTheme::default())
-        .with_prompt("Pfad zum Datenspeicher")
-        .default("./stone_data".into())
-        .interact_text()
-        .unwrap();
-    let data_dir = PathBuf::from(&data_dir);
+// ═════════════════════════════════════════════════════════════════════════════
+// KONFIGURATION ANPASSEN — Einzelne Werte ändern
+// ═════════════════════════════════════════════════════════════════════════════
 
-    fs::create_dir_all(&data_dir).unwrap_or_else(|e| {
-        eprintln!("{} Verzeichnis konnte nicht erstellt werden: {e}", style("✗").red());
-        std::process::exit(1);
-    });
-    println!("{} Verzeichnis: {}", style("✓").green(), style(data_dir.display()).cyan());
-
-    // ── Schritt 2: HTTP-Port ──────────────────────────────────────────────────
-    section("2 / 7", "HTTP API Port");
-    let http_port: u16 = Input::with_theme(&ColorfulTheme::default())
-        .with_prompt("Port (1–65535)")
-        .default(8080)
-        .validate_with(|p: &u16| {
-            if *p < 1 { Err("Port muss ≥ 1 sein") } else { Ok(()) }
-        })
-        .interact_text()
-        .unwrap();
-    println!("{} Port: {}", style("✓").green(), style(http_port).cyan());
-
-    // ── Schritt 3: Node-Name ──────────────────────────────────────────────────
-    section("3 / 7", "Node-Name");
-    let default_name = hostname::get()
-        .ok()
-        .and_then(|h| h.into_string().ok())
-        .unwrap_or_else(|| "stone-node".into());
-    let node_name: String = Input::with_theme(&ColorfulTheme::default())
-        .with_prompt("Name dieses Nodes (wird in der Trust-Registry angezeigt)")
-        .default(default_name)
-        .interact_text()
-        .unwrap();
-    println!("{} Node-Name: {}", style("✓").green(), style(&node_name).cyan());
-
-    // ── Schritt 4: Max. Storage ───────────────────────────────────────────────
-    section("4 / 7", "Maximaler Speicherplatz");
-    let max_storage_gb: u32 = Input::with_theme(&ColorfulTheme::default())
-        .with_prompt("Maximaler Speicher in GB (0 = unbegrenzt)")
-        .default(10u32)
-        .interact_text()
-        .unwrap();
-    if max_storage_gb == 0 {
-        println!("{} Speicher: unbegrenzt", style("✓").green());
-    } else {
-        println!("{} Speicher: {} GB", style("✓").green(), style(max_storage_gb).cyan());
-    }
-
-    // ── Schritt 5: Bootstrap-Peers ────────────────────────────────────────────
-    section("5 / 7", "Bootstrap-Peers");
+fn adjust_config() {
+    println!();
     println!(
         "{}",
-        style("Wähle Peers zum initialen Sync (Leertaste = auswählen, Enter = bestätigen):").dim()
+        style("  ── Konfiguration anpassen ──────────────────────────────────────────")
+            .cyan()
+            .bold()
     );
+    println!(
+        "{}",
+        style("  Wähle was du ändern möchtest. Leere Eingabe = Wert beibehalten.").dim()
+    );
+    println!();
 
-    let labels: Vec<&str> = BOOTSTRAP_NODES.iter().map(|(l, _)| *l).collect();
+    let adjustable = &[
+        "Node-Name",
+        "HTTP-Port",
+        "P2P-Port",
+        "Seed-Peers",
+        "API-Key neu generieren",
+        "Max. Speicher (GB)",
+        "← Zurück",
+    ];
+
     let selections = MultiSelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Bootstrap-Nodes")
-        .items(&labels)
+        .with_prompt("Was anpassen? (Leertaste = auswählen, Enter = bestätigen)")
+        .items(adjustable)
         .interact()
         .unwrap_or_default();
 
-    let mut bootstrap_peers: Vec<String> = Vec::new();
-    let mut needs_custom = false;
-
-    for idx in &selections {
-        let (_, url) = BOOTSTRAP_NODES[*idx];
-        if url == "__custom__" {
-            needs_custom = true;
-        } else {
-            bootstrap_peers.push(url.to_string());
-        }
+    if selections.is_empty() || selections.contains(&6) {
+        println!("{} Nichts geändert.", style("ℹ").dim());
+        handle_existing_config();
+        return;
     }
 
-    // Eigene Adressen eingeben
-    if needs_custom || selections.is_empty() {
-        if selections.is_empty() {
-            println!(
-                "{}",
-                style("Keine vordefinierten Peers gewählt. Eigene Adresse eingeben:").yellow()
-            );
-        }
-        loop {
-            let custom: String = Input::with_theme(&ColorfulTheme::default())
-                .with_prompt("Peer-URL (leer lassen zum Beenden)")
-                .allow_empty(true)
-                .interact_text()
-                .unwrap();
-            if custom.trim().is_empty() {
-                break;
+    let env_content = fs::read_to_string(".env").unwrap_or_default();
+    let mut changes: Vec<(String, String)> = Vec::new();
+
+    for &idx in &selections {
+        match idx {
+            0 => {
+                let current = extract_env_val(&env_content, "STONE_NODE_NAME");
+                let new_val: String = Input::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Neuer Node-Name")
+                    .default(current)
+                    .interact_text()
+                    .unwrap();
+                changes.push(("STONE_NODE_NAME".into(), new_val.clone()));
+                changes.push(("STONE_NODE_ID".into(), new_val));
             }
-            let url = custom.trim().to_string();
-            // Einfache Validierung
-            if url.starts_with("http://") || url.starts_with("https://") {
-                bootstrap_peers.push(url);
-            } else {
-                println!("{} URL muss mit http:// oder https:// beginnen.", style("!").yellow());
+            1 => {
+                let current: u16 = extract_env_val(&env_content, "STONE_PORT")
+                    .parse()
+                    .unwrap_or(8080);
+                let new_val: u16 = Input::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Neuer HTTP-Port")
+                    .default(current)
+                    .interact_text()
+                    .unwrap();
+                changes.push(("STONE_PORT".into(), new_val.to_string()));
             }
-        }
-    }
-
-    // Deduplizieren
-    let bootstrap_peers: Vec<String> = bootstrap_peers
-        .into_iter()
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-
-    if bootstrap_peers.is_empty() {
-        println!(
-            "{} Keine Bootstrap-Peers — Node startet isoliert.",
-            style("ℹ").cyan()
-        );
-    } else {
-        println!(
-            "{} {} Peer(s) konfiguriert.",
-            style("✓").green(),
-            bootstrap_peers.len()
-        );
-        for p in &bootstrap_peers {
-            println!("   {}", style(p).dim());
-        }
-    }
-
-    // ── Schritt 6: P2P-Port + PSK ─────────────────────────────────────────────
-    section("6 / 7", "P2P-Netzwerk & PSK");
-
-    let p2p_port: u16 = Input::with_theme(&ColorfulTheme::default())
-        .with_prompt("P2P-Lauschport (libp2p TCP)")
-        .default(4001u16)
-        .interact_text()
-        .unwrap();
-
-    let psk_choices = &[
-        "Automatisch neuen PSK generieren (empfohlen für private Cluster)",
-        "Bestehenden PSK-Secret eingeben",
-        "PSK deaktivieren (offenes Netzwerk)",
-    ];
-    let psk_choice = FuzzySelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Pre-Shared Key (PSK) für pnet")
-        .items(psk_choices)
-        .default(0)
-        .interact()
-        .unwrap();
-
-    let (psk_enabled, psk_secret) = match psk_choice {
-        0 => {
-            let secret = generate_hex(32);
-            println!("{} PSK generiert: {}", style("✓").green(), style(&secret).cyan());
-            (true, Some(secret))
-        }
-        1 => {
-            let secret: String = Password::with_theme(&ColorfulTheme::default())
-                .with_prompt("PSK-Secret eingeben")
-                .with_confirmation("Bestätigen", "Eingaben stimmen nicht überein")
-                .interact()
-                .unwrap();
-            (true, Some(secret))
-        }
-        _ => {
-            println!("{} PSK deaktiviert.", style("ℹ").yellow());
-            (false, None)
-        }
-    };
-
-    // ── Schritt 7: Öffentlicher Zugang (Cloudflare Tunnel) ───────────────────
-    section("7 / 8", "Öffentlicher Zugang");
-
-    println!("{}", style("  Damit andere Nodes dich erreichen können, ohne Port-Freigabe:").dim());
-    println!("{}", style("  Cloudflare Tunnel leitet eine öffentliche HTTPS-URL zu deiner Node.").dim());
-    println!("{}", style("  Kein Router, kein Port-Forwarding, funktioniert hinter NAT/CGNAT.").dim());
-    println!();
-
-    let tunnel_choices = &[
-        "Quick-Tunnel  (keine Anmeldung – temporäre *.trycloudflare.com URL)",
-        "Named-Tunnel  (Cloudflare-Account – feste URL, z.B. meinnode.unrooted.dev)",
-        "Kein Tunnel   (nur lokales Netzwerk / manuelle Port-Freigabe)",
-    ];
-    let tunnel_choice = FuzzySelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Öffentlicher Zugang")
-        .items(tunnel_choices)
-        .default(0)
-        .interact()
-        .unwrap();
-
-    let (tunnel_mode, tunnel_token, tunnel_domain) = match tunnel_choice {
-        0 => {
-            // cloudflared prüfen
-            let cf_available = std::process::Command::new("which")
-                .arg("cloudflared")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-                || Path::new("/opt/homebrew/bin/cloudflared").exists()
-                || Path::new("/usr/local/bin/cloudflared").exists();
-
-            if !cf_available {
+            2 => {
+                let current: u16 = extract_env_val(&env_content, "STONE_P2P_PORT")
+                    .parse()
+                    .unwrap_or(4001);
+                let new_val: u16 = Input::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Neuer P2P-Port")
+                    .default(current)
+                    .interact_text()
+                    .unwrap();
+                changes.push(("STONE_P2P_PORT".into(), new_val.to_string()));
+                changes.push((
+                    "STONE_P2P_LISTEN".into(),
+                    format!("/ip4/0.0.0.0/tcp/{new_val}"),
+                ));
+            }
+            3 => {
+                println!();
+                let peers = select_seed_peers();
+                if !peers.is_empty() {
+                    changes.push(("STONE_SEED_NODES".into(), peers.join(",")));
+                }
+            }
+            4 => {
+                let new_key = format!("sk_{}", generate_hex(32));
                 println!(
-                    "{} cloudflared nicht gefunden. Installieren mit:",
-                    style("!").yellow()
+                    "{} Neuer API-Key: {}…",
+                    style("✓").green(),
+                    style(&new_key[..14]).cyan()
                 );
-                println!("   {}", style("brew install cloudflared").green());
-                println!("{} Quick-Tunnel wird trotzdem konfiguriert.", style("ℹ").cyan());
-                println!("{} Falls cloudflared beim Node-Start fehlt, wird die Node normal gestartet.", style("ℹ").dim());
-            } else {
-                println!("{} cloudflared gefunden – Quick-Tunnel wird beim Node-Start automatisch aktiviert.", style("✓").green());
+                changes.push(("STONE_CLUSTER_API_KEY".into(), new_key.clone()));
+                changes.push(("STONE_API_KEY".into(), new_key));
             }
-            ("quick", None, None)
-        }
-        1 => {
-            println!("{} Named-Tunnel benötigt ein Cloudflare-Konto und einen Tunnel-Token.", style("ℹ").cyan());
-            println!("  Token erstellen unter: {}", style("https://one.dash.cloudflare.com → Zero Trust → Tunnels").cyan());
-            println!();
-            let token: String = Password::with_theme(&ColorfulTheme::default())
-                .with_prompt("Tunnel-Token")
-                .interact()
-                .unwrap();
-            let domain: String = Input::with_theme(&ColorfulTheme::default())
-                .with_prompt("Öffentliche Domain (z.B. meinnode.unrooted.dev)")
-                .interact_text()
-                .unwrap();
-            println!("{} Named-Tunnel konfiguriert: {}", style("✓").green(), style(&domain).cyan());
-            ("named", Some(token), Some(domain))
-        }
-        _ => {
-            println!("{} Kein Tunnel – Node ist nur lokal erreichbar.", style("ℹ").cyan());
-            ("off", None, None)
-        }
-    };
-
-    // ── Schritt 8: API-Key ────────────────────────────────────────────────────
-    section("8 / 8", "Admin API-Key");
-    let api_key_choices = &[
-        "Automatisch generieren (empfohlen)",
-        "Eigenen API-Key eingeben",
-    ];
-    let api_key_choice = FuzzySelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("API-Key")
-        .items(api_key_choices)
-        .default(0)
-        .interact()
-        .unwrap();
-
-    let api_key = match api_key_choice {
-        1 => {
-            let key: String = Password::with_theme(&ColorfulTheme::default())
-                .with_prompt("API-Key eingeben (mind. 32 Zeichen)")
-                .validate_with(|s: &String| {
-                    if s.len() >= 32 {
-                        Ok(())
-                    } else {
-                        Err("Mind. 32 Zeichen erforderlich")
-                    }
-                })
-                .interact()
-                .unwrap();
-            key
-        }
-        _ => {
-            let key = format!("sk_{}", generate_hex(32));
-            println!("{} API-Key generiert.", style("✓").green());
-            key
-        }
-    };
-
-    let config = Config {
-        data_dir,
-        http_port,
-        node_name,
-        max_storage_gb,
-        bootstrap_peers,
-        p2p_port,
-        psk_enabled,
-        psk_secret,
-        api_key,
-        tunnel_mode: tunnel_mode.to_string(),
-        tunnel_token,
-        tunnel_domain,
-    };
-
-    // ── .env schreiben ────────────────────────────────────────────────────────
-    write_env(&config);
-
-    // ── PSK-Datei schreiben ───────────────────────────────────────────────────
-    if let Some(ref secret) = config.psk_secret {
-        let psk_path = config.data_dir.join("psk.key");
-        fs::write(&psk_path, secret)
-            .unwrap_or_else(|e| eprintln!("{} PSK konnte nicht gespeichert werden: {e}", style("!").yellow()));
-        println!("{} PSK-Secret gespeichert: {}", style("✓").green(), psk_path.display());
-    }
-
-    // ── Zusammenfassung ───────────────────────────────────────────────────────
-    print_summary(&config);
-
-    // ── Initialer Sync-Check ──────────────────────────────────────────────────
-    if !config.bootstrap_peers.is_empty() {
-        let run_check = Confirm::with_theme(&ColorfulTheme::default())
-            .with_prompt("Erreichbarkeit der Bootstrap-Peers jetzt prüfen?")
-            .default(true)
-            .interact()
-            .unwrap_or(false);
-
-        if run_check {
-            check_bootstrap_peers(&config.bootstrap_peers);
+            5 => {
+                let current: u32 = {
+                    let bytes_str = extract_env_val(&env_content, "STONE_MAX_STORAGE_BYTES");
+                    let bytes: u64 = bytes_str.parse().unwrap_or(0);
+                    (bytes / 1_073_741_824) as u32
+                };
+                let new_val: u32 = Input::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Max. Speicher in GB (0 = unbegrenzt)")
+                    .default(current)
+                    .interact_text()
+                    .unwrap();
+                let bytes = if new_val == 0 { 0u64 } else { new_val as u64 * 1024 * 1024 * 1024 };
+                changes.push(("STONE_MAX_STORAGE_BYTES".into(), bytes.to_string()));
+            }
+            _ => {}
         }
     }
 
-    // ── Node starten? ─────────────────────────────────────────────────────────
-    let start_node = Confirm::with_theme(&ColorfulTheme::default())
+    if changes.is_empty() {
+        println!("{} Nichts geändert.", style("ℹ").dim());
+    } else {
+        let mut content = env_content;
+        for (key, val) in &changes {
+            content = patch_env_line(&content, key, val);
+        }
+        fs::write(".env", &content).unwrap_or_else(|e| {
+            eprintln!("{} .env konnte nicht geschrieben werden: {e}", style("✗").red());
+        });
+        println!();
+        println!(
+            "{} {} Wert(e) in .env aktualisiert.",
+            style("✓").green(),
+            changes.len()
+        );
+    }
+
+    println!();
+    let start = Confirm::with_theme(&ColorfulTheme::default())
         .with_prompt("Node jetzt starten?")
         .default(true)
         .interact()
         .unwrap_or(false);
 
-    if start_node {
+    if start {
         launch_node();
-    } else {
-        println!("\n{}", style("╔══════════════════════════════════════════════════╗").cyan());
-        println!("{}", style("║  Setup abgeschlossen. Node starten mit:          ║").cyan());
-        println!("{}", style("║                                                  ║").cyan());
-        println!(
-            "{}  {}  {}",
-            style("║").cyan(),
-            style("  cargo run --release --bin stone-master         ").green(),
-            style("║").cyan()
-        );
-        println!("{}", style("║                                                  ║").cyan());
-        println!("{}", style("╚══════════════════════════════════════════════════╝").cyan());
     }
 }
 
-// ─── .env schreiben ──────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// SEED-PEER AUSWAHL
+// ═════════════════════════════════════════════════════════════════════════════
+
+fn select_seed_peers() -> Vec<String> {
+    let mut labels: Vec<String> = WELL_KNOWN_SEEDS
+        .iter()
+        .map(|(name, _)| name.to_string())
+        .collect();
+    labels.push("✏️  Eigene Adresse eingeben…".into());
+
+    let selections = MultiSelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("Seed-Nodes (Leertaste = auswählen, Enter = bestätigen)")
+        .items(&labels)
+        .interact()
+        .unwrap_or_default();
+
+    let mut peers: Vec<String> = Vec::new();
+    let mut needs_custom = false;
+
+    for idx in &selections {
+        if *idx < WELL_KNOWN_SEEDS.len() {
+            peers.push(WELL_KNOWN_SEEDS[*idx].1.to_string());
+        } else {
+            needs_custom = true;
+        }
+    }
+
+    if needs_custom || selections.is_empty() {
+        if selections.is_empty() {
+            println!(
+                "{}",
+                style("  Keine vordefinierten Peers gewählt. Gib die Adresse eines bestehenden Nodes ein:").yellow()
+            );
+            println!(
+                "{}",
+                style("  Format: /ip4/<IP>/tcp/<PORT>/p2p/<PeerId>").dim()
+            );
+        }
+        loop {
+            let custom: String = Input::with_theme(&ColorfulTheme::default())
+                .with_prompt("Peer-Adresse (leer = fertig)")
+                .allow_empty(true)
+                .interact_text()
+                .unwrap();
+            let addr = custom.trim().to_string();
+            if addr.is_empty() {
+                break;
+            }
+            if addr.starts_with("/ip4/")
+                || addr.starts_with("/ip6/")
+                || addr.starts_with("/dns")
+            {
+                peers.push(addr);
+            } else {
+                println!(
+                    "{} Ungültiges Format. Beispiel: /ip4/1.2.3.4/tcp/4001/p2p/12D3Koo...",
+                    style("!").yellow()
+                );
+            }
+        }
+    }
+
+    // Deduplizieren
+    let peers: Vec<String> = peers
+        .into_iter()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    if peers.is_empty() {
+        println!(
+            "{} Keine Seed-Peers — Node startet isoliert (nur mDNS-Discovery).",
+            style("ℹ").yellow()
+        );
+    } else {
+        println!(
+            "{} {} Seed-Peer(s) konfiguriert:",
+            style("✓").green(),
+            peers.len()
+        );
+        for p in &peers {
+            println!("   {}", style(p).dim());
+        }
+    }
+
+    peers
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// .ENV SCHREIBEN
+// ═════════════════════════════════════════════════════════════════════════════
 
 fn write_env(cfg: &Config) {
     let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::with_template("{spinner:.cyan} {msg}").unwrap(),
-    );
+    pb.set_style(ProgressStyle::with_template("{spinner:.cyan} {msg}").unwrap());
     pb.set_message(".env wird geschrieben…");
     pb.enable_steady_tick(Duration::from_millis(80));
 
-    let bootstrap_str = cfg.bootstrap_peers.join(",");
     let storage_bytes: u64 = if cfg.max_storage_gb == 0 {
         0
     } else {
         cfg.max_storage_gb as u64 * 1024 * 1024 * 1024
     };
 
-    let mut lines: Vec<String> = vec![
-        "# ── Stone Master Node — generiert von stone-setup ──────────────────────".into(),
+    let seed_str = cfg.seed_peers.join(",");
+
+    let lines: Vec<String> = vec![
+        "# ── Stone Node — generiert von stone-setup ─────────────────────────────".into(),
         format!("# Erstellt: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S")),
+        format!("# Node: {}", cfg.node_name),
         "".into(),
         "# ── Basis ───────────────────────────────────────────────────────────────".into(),
         format!("STONE_DATA_DIR={}", cfg.data_dir.display()),
@@ -567,103 +530,67 @@ fn write_env(cfg: &Config) {
         "# ── P2P-Netzwerk ────────────────────────────────────────────────────────".into(),
         format!("STONE_P2P_LISTEN=/ip4/0.0.0.0/tcp/{}", cfg.p2p_port),
         format!("STONE_P2P_PORT={}", cfg.p2p_port),
+        "".into(),
+        "# ── Seed-Nodes (Netzwerk-Einstieg) ──────────────────────────────────────".into(),
+        if seed_str.is_empty() {
+            "# STONE_SEED_NODES=".into()
+        } else {
+            format!("STONE_SEED_NODES={}", seed_str)
+        },
+        "".into(),
+        "# ── PSK / pnet ──────────────────────────────────────────────────────────".into(),
+        "STONE_P2P_PSK_DISABLED=1".into(),
+        "".into(),
     ];
-
-    if cfg.bootstrap_peers.is_empty() {
-        lines.push("# STONE_BOOTSTRAP_NODES=".into());
-    } else {
-        lines.push(format!("STONE_BOOTSTRAP_NODES={}", bootstrap_str));
-    }
-
-    lines.push("".into());
-    lines.push("# ── PSK / pnet ──────────────────────────────────────────────────────────".into());
-    if cfg.psk_enabled {
-        if let Some(ref secret) = cfg.psk_secret {
-            lines.push(format!("STONE_PSK_SECRET={}", secret));
-        }
-        lines.push("STONE_P2P_PSK_DISABLED=0".into());
-    } else {
-        lines.push("STONE_P2P_PSK_DISABLED=1".into());
-    }
-
-    lines.push("".into());
-    lines.push("# ── TLS ─────────────────────────────────────────────────────────────────".into());
-    lines.push("# Zertifikate werden automatisch verwaltet (Embedded-CA).".into());
-    lines.push("# Für Cluster-Betrieb: stone_data/tls/root.crt + root.key auf alle Nodes kopieren.".into());
-    lines.push(format!("STONE_TLS_CERT={}/tls/node.crt", cfg.data_dir.display()));
-    lines.push(format!("STONE_TLS_KEY={}/tls/node.key", cfg.data_dir.display()));
-
-    lines.push("".into());
-    lines.push("# ── Cloudflare Tunnel ───────────────────────────────────────────────────".into());
-    lines.push("# quick   = temporäre *.trycloudflare.com URL (kein Account nötig)".into());
-    lines.push("# named   = feste URL via Cloudflare-Token (STONE_TUNNEL_TOKEN setzen)".into());
-    lines.push("# off/leer = kein Tunnel".into());
-    match cfg.tunnel_mode.as_str() {
-        "quick" => {
-            lines.push("STONE_TUNNEL=quick".into());
-            lines.push("# STONE_TUNNEL_TOKEN=".into());
-            lines.push("# STONE_TUNNEL_DOMAIN=".into());
-        }
-        "named" => {
-            lines.push("STONE_TUNNEL=named".into());
-            if let Some(ref token) = cfg.tunnel_token {
-                lines.push(format!("STONE_TUNNEL_TOKEN={}", token));
-            }
-            if let Some(ref domain) = cfg.tunnel_domain {
-                lines.push(format!("STONE_TUNNEL_DOMAIN={}", domain));
-            }
-        }
-        _ => {
-            lines.push("# STONE_TUNNEL=quick".into());
-            lines.push("# STONE_TUNNEL_TOKEN=".into());
-            lines.push("# STONE_TUNNEL_DOMAIN=".into());
-        }
-    }
 
     let content = lines.join("\n") + "\n";
     fs::write(".env", &content).unwrap_or_else(|e| {
-        eprintln!("{} .env konnte nicht geschrieben werden: {e}", style("✗").red());
+        eprintln!(
+            "{} .env konnte nicht geschrieben werden: {e}",
+            style("✗").red()
+        );
         std::process::exit(1);
     });
 
     pb.finish_with_message(format!("{} .env geschrieben.", style("✓").green()));
 }
 
-// ─── Bootstrap-Peers pingen ──────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// SEED-PEER ERREICHBARKEIT
+// ═════════════════════════════════════════════════════════════════════════════
 
-fn check_bootstrap_peers(peers: &[String]) {
-    println!("\n{}", style("── Erreichbarkeits-Check ─────────────────────────────────────────").dim());
+fn check_seed_peers(peers: &[String]) {
+    println!(
+        "{}",
+        style("  ── Erreichbarkeits-Check ─────────────────────────────────────────").dim()
+    );
 
     let pb = ProgressBar::new(peers.len() as u64);
     pb.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.cyan} [{bar:30.cyan/blue}] {pos}/{len} {msg}",
-        )
-        .unwrap()
-        .progress_chars("━─ "),
+        ProgressStyle::with_template("{spinner:.cyan} [{bar:30.cyan/blue}] {pos}/{len} {msg}")
+            .unwrap()
+            .progress_chars("━─ "),
     );
 
     let mut reachable = 0usize;
 
     for peer in peers {
-        pb.set_message(format!("Prüfe {}…", peer));
-
-        let health_url = format!(
-            "{}/api/v1/health",
-            peer.trim_end_matches('/')
-        );
-
-        let ok = std::process::Command::new("curl")
-            .args(["-sf", "--max-time", "4", &health_url])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        pb.set_message(format!("Prüfe {}…", truncate_addr(peer)));
+        let ok = check_multiaddr_reachable(peer);
 
         if ok {
-            pb.println(format!("  {} {}", style("✓").green(), style(peer).cyan()));
+            pb.println(format!(
+                "  {} {}",
+                style("✓").green(),
+                style(truncate_addr(peer)).cyan()
+            ));
             reachable += 1;
         } else {
-            pb.println(format!("  {} {} (nicht erreichbar)", style("✗").red(), style(peer).dim()));
+            pb.println(format!(
+                "  {} {} (nicht erreichbar)",
+                style("✗").red(),
+                style(truncate_addr(peer)).dim()
+            ));
         }
 
         pb.inc(1);
@@ -674,13 +601,12 @@ fn check_bootstrap_peers(peers: &[String]) {
 
     if reachable == 0 && !peers.is_empty() {
         println!(
-            "\n{} Kein Bootstrap-Peer erreichbar — der Node startet im Standalone-Modus.",
+            "\n{} Kein Seed-Peer erreichbar — Node startet trotzdem und versucht es später erneut.",
             style("ℹ").yellow()
         );
-        println!("{}", style("  (Das ist ok für lokale Entwicklung)").dim());
     } else {
         println!(
-            "\n{} {}/{} Peer(s) erreichbar.",
+            "\n{} {}/{} Seed-Peer(s) erreichbar.",
             style("✓").green(),
             reachable,
             peers.len()
@@ -688,106 +614,150 @@ fn check_bootstrap_peers(peers: &[String]) {
     }
 }
 
-// ─── Node starten ────────────────────────────────────────────────────────────
+fn check_multiaddr_reachable(addr: &str) -> bool {
+    let parts: Vec<&str> = addr.split('/').collect();
+    let mut ip = None;
+    let mut port = None;
+
+    for i in 0..parts.len() {
+        if (parts[i] == "ip4" || parts[i] == "ip6") && i + 1 < parts.len() {
+            ip = Some(parts[i + 1]);
+        }
+        if parts[i] == "tcp" && i + 1 < parts.len() {
+            port = parts[i + 1].parse::<u16>().ok();
+        }
+    }
+
+    if let (Some(ip), Some(port)) = (ip, port) {
+        let target = format!("{ip}:{port}");
+        if let Ok(addr) = target.parse() {
+            TcpStream::connect_timeout(&addr, Duration::from_secs(3)).is_ok()
+        } else {
+            false
+        }
+    } else {
+        false
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// NODE STARTEN
+// ═════════════════════════════════════════════════════════════════════════════
 
 fn launch_node() {
-    println!("\n{}", style("── Node wird gestartet ───────────────────────────────────────────").cyan());
+    println!(
+        "\n{}",
+        style("  ── Node wird gestartet ─────────────────────────────────────────────").cyan()
+    );
 
-    // Zuerst binary prüfen
     let bin = if Path::new("./target/release/stone-master").exists() {
         "./target/release/stone-master"
     } else if Path::new("./target/debug/stone-master").exists() {
         "./target/debug/stone-master"
     } else {
-        println!("{} Kein kompiliertes Binary gefunden.", style("!").yellow());
-        println!("Bitte zuerst ausführen: {}", style("cargo build --release --bin stone-master").green());
+        println!(
+            "{} Kein kompiliertes Binary gefunden.",
+            style("!").yellow()
+        );
+        println!(
+            "  Bitte zuerst: {}",
+            style("cargo build --release --bin stone-master").green()
+        );
         return;
     };
 
-    println!("{} Starte: {}", style("▶").cyan(), style(bin).green());
-    println!("{}", style("(Ctrl+C zum Beenden)").dim());
+    println!(
+        "{} Starte: {}",
+        style("▶").cyan(),
+        style(bin).green()
+    );
+    println!("{}", style("  (Ctrl+C zum Beenden)").dim());
     println!();
 
-    // Stdin/Stdout/Stderr erben → interaktives Erlebnis
-    let status = Command::new(bin)
-        .status()
-        .unwrap_or_else(|e| {
-            eprintln!("{} Fehler beim Starten: {e}", style("✗").red());
-            std::process::exit(1);
-        });
+    let status = Command::new(bin).status().unwrap_or_else(|e| {
+        eprintln!("{} Fehler beim Starten: {e}", style("✗").red());
+        std::process::exit(1);
+    });
 
     if !status.success() {
-        eprintln!("{} Node beendet mit Code: {}", style("✗").red(), status);
+        eprintln!(
+            "{} Node beendet mit Code: {}",
+            style("✗").red(),
+            status
+        );
     }
 }
 
-// ─── Banner + UI-Helpers ──────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// .ENV HILFSFUNKTIONEN
+// ═════════════════════════════════════════════════════════════════════════════
 
-/// Liest relevante Werte aus .env und zeigt eine kompakte Zusammenfassung.
-fn show_existing_config_summary() {
-    let Ok(content) = fs::read_to_string(".env") else { return };
-
-    let get = |key: &str| -> String {
-        content
-            .lines()
-            .find(|l| l.starts_with(&format!("{key}=")))
-            .and_then(|l| l.splitn(2, '=').nth(1))
-            .unwrap_or("–")
-            .to_string()
-    };
-
-    println!("{}", style("  ── Vorhandene Konfiguration ─────────────────────────────────────────").dim());
-    kv("Node-Name",  &get("STONE_NODE_NAME"));
-    kv("Port",       &get("STONE_PORT"));
-    kv("Data-Dir",   &get("STONE_DATA_DIR"));
-    let key = get("STONE_CLUSTER_API_KEY");
-    let short_key = if key.len() > 14 { format!("{}…", &key[..14]) } else { key };
-    kv("API-Key",    &short_key);
-    let psk_dis = get("STONE_P2P_PSK_DISABLED");
-    kv("PSK/pnet",   if psk_dis == "1" { "deaktiviert" } else { "aktiv" });
-    println!();
+fn extract_env_opt(content: &str, key: &str) -> Option<String> {
+    content
+        .lines()
+        .find(|l| {
+            let t = l.trim();
+            !t.starts_with('#') && t.starts_with(&format!("{key}="))
+        })
+        .and_then(|l| l.splitn(2, '=').nth(1))
+        .map(|v| v.to_string())
 }
 
-/// Gibt alle gesetzten (nicht-kommentierten) Zeilen aus .env aus.
-fn show_full_env() {
-    let Ok(content) = fs::read_to_string(".env") else {
-        println!("{} .env nicht gefunden.", style("✗").red());
-        return;
-    };
-    println!("\n{}", style("  ── .env Inhalt ──────────────────────────────────────────────────────").cyan());
-    for line in content.lines() {
-        if line.trim().is_empty() || line.trim_start().starts_with('#') {
-            continue;
-        }
-        // API-Keys/Secrets kürzen
-        if let Some((k, v)) = line.splitn(2, '=').collect::<Vec<_>>().as_slice().split_first() {
-            let k = *k;
-            let v = v.join("=");
-            let display_val = if k.contains("KEY") || k.contains("SECRET") || k.contains("PASSWORD") {
-                if v.len() > 14 { format!("{}…", &v[..14]) } else { v }
+fn extract_env_val(content: &str, key: &str) -> String {
+    extract_env_opt(content, key).unwrap_or_default()
+}
+
+fn patch_env_line(content: &str, key: &str, val: &str) -> String {
+    let prefix = format!("{key}=");
+    let mut found = false;
+    let lines: Vec<String> = content
+        .lines()
+        .map(|line| {
+            let t = line.trim();
+            if !t.starts_with('#') && t.starts_with(&prefix) {
+                found = true;
+                format!("{key}={val}")
             } else {
-                v
-            };
-            println!("    {:<30} {}", style(k).dim(), style(display_val).cyan());
+                line.to_string()
+            }
+        })
+        .collect();
+
+    let mut result = lines.join("\n");
+    if !found {
+        if !result.ends_with('\n') {
+            result.push('\n');
         }
+        result.push_str(&format!("{key}={val}\n"));
     }
-    println!();
+    result
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// UI HELPERS
+// ═════════════════════════════════════════════════════════════════════════════
 
 fn print_banner() {
-    println!("{}", style(r#"
+    println!(
+        "{}",
+        style(
+            r#"
   ███████╗████████╗ ██████╗ ███╗   ██╗███████╗
   ██╔════╝╚══██╔══╝██╔═══██╗████╗  ██║██╔════╝
   ███████╗   ██║   ██║   ██║██╔██╗ ██║█████╗
   ╚════██║   ██║   ██║   ██║██║╚██╗██║██╔══╝
   ███████║   ██║   ╚██████╔╝██║ ╚████║███████╗
   ╚══════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚══════╝
-    "#).cyan().bold());
-    println!("{}", style("  Setup-Wizard — StoneChain Master Node").bold());
-    println!("{}", style("  ─────────────────────────────────────────────────").dim());
-    println!();
-    println!("{}", style("  Dieser Wizard führt dich durch die Erstkonfiguration.").dim());
-    println!("{}", style("  Alle Einstellungen werden in '.env' gespeichert.").dim());
+    "#
+        )
+        .cyan()
+        .bold()
+    );
+    println!("{}", style("  Stone Node — Setup-Wizard").bold());
+    println!(
+        "{}",
+        style("  ─────────────────────────────────────────────────").dim()
+    );
     println!();
 }
 
@@ -801,28 +771,13 @@ fn section(step: &str, title: &str) {
     println!();
 }
 
-fn print_summary(cfg: &Config) {
-    println!();
-    println!("{}", style("  ── Zusammenfassung ──────────────────────────────────────────────────").cyan().bold());
-    println!();
-    kv("Data-Directory",  &cfg.data_dir.display().to_string());
-    kv("HTTP-Port",       &cfg.http_port.to_string());
-    kv("Node-Name",       &cfg.node_name);
-    kv("Max. Storage",    &if cfg.max_storage_gb == 0 { "unbegrenzt".into() } else { format!("{} GB", cfg.max_storage_gb) });
-    kv("Bootstrap-Peers", &if cfg.bootstrap_peers.is_empty() { "keine (standalone)".to_string() } else { cfg.bootstrap_peers.join(", ") });
-    kv("P2P-Port",        &cfg.p2p_port.to_string());
-    kv("PSK / pnet",      if cfg.psk_enabled { "aktiviert" } else { "deaktiviert" });
-    kv("API-Key",         &format!("{}…", &cfg.api_key[..12.min(cfg.api_key.len())]));
-    kv("TLS",             "aktiv (Embedded-CA, auto-verwaltet)");
-    let ca_path = cfg.data_dir.join("tls/root.crt");
-    kv("Root-CA",         &ca_path.display().to_string());
-    let tunnel_summary = match cfg.tunnel_mode.as_str() {
-        "quick" => "Quick-Tunnel (*.trycloudflare.com)".to_string(),
-        "named" => format!("Named-Tunnel → {}", cfg.tunnel_domain.as_deref().unwrap_or("?")),
-        _       => "deaktiviert".to_string(),
-    };
-    kv("Tunnel",          &tunnel_summary);
-    println!();
+fn auto_step(label: &str, value: &str) {
+    println!(
+        "    {} {:<20} {}",
+        style("⚙").dim(),
+        style(label).dim(),
+        style(value).cyan()
+    );
 }
 
 fn kv(key: &str, val: &str) {
@@ -833,9 +788,135 @@ fn kv(key: &str, val: &str) {
     );
 }
 
-// ─── Kryptographische Hilfsfunktionen ─────────────────────────────────────────
+fn show_existing_config_summary() {
+    let Ok(content) = fs::read_to_string(".env") else { return };
+    let get = |key: &str| extract_env_val(&content, key);
 
-/// Generiert `n` zufällige Bytes als lowercase Hex-String.
+    println!(
+        "{}",
+        style("  ── Aktuelle Konfiguration ───────────────────────────────────────────").dim()
+    );
+    kv("Node-Name", &get("STONE_NODE_NAME"));
+    kv("HTTP-Port", &get("STONE_PORT"));
+    kv("P2P-Port", &get("STONE_P2P_PORT"));
+    kv("Data-Dir", &get("STONE_DATA_DIR"));
+
+    let key = get("STONE_CLUSTER_API_KEY");
+    let short_key = if key.len() > 14 {
+        format!("{}…", &key[..14])
+    } else if key.is_empty() {
+        "–".into()
+    } else {
+        key
+    };
+    kv("API-Key", &short_key);
+
+    let seeds = get("STONE_SEED_NODES");
+    let seed_count = if seeds.is_empty() { 0 } else { seeds.split(',').count() };
+    kv("Seed-Peers", &format!("{} konfiguriert", seed_count));
+    println!();
+}
+
+fn show_full_env() {
+    let Ok(content) = fs::read_to_string(".env") else {
+        println!("{} .env nicht gefunden.", style("✗").red());
+        return;
+    };
+    println!(
+        "\n{}",
+        style("  ── .env Inhalt ──────────────────────────────────────────────────────").cyan()
+    );
+    for line in content.lines() {
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            let display_val = if k.contains("KEY") || k.contains("SECRET") || k.contains("TOKEN") {
+                if v.len() > 14 { format!("{}…", &v[..14]) } else { v.to_string() }
+            } else {
+                v.to_string()
+            };
+            println!(
+                "    {:<30} {}",
+                style(k).dim(),
+                style(display_val).cyan()
+            );
+        }
+    }
+    println!();
+}
+
+fn print_summary(cfg: &Config) {
+    println!();
+    println!(
+        "{}",
+        style("  ── Zusammenfassung ──────────────────────────────────────────────────")
+            .cyan()
+            .bold()
+    );
+    println!();
+    kv("Node-Name", &cfg.node_name);
+    kv("Data-Directory", &cfg.data_dir.display().to_string());
+    kv("HTTP-Port", &cfg.http_port.to_string());
+    kv("P2P-Port", &cfg.p2p_port.to_string());
+    kv(
+        "Seed-Peers",
+        &if cfg.seed_peers.is_empty() { "keine (standalone)".into() } else { format!("{}", cfg.seed_peers.len()) },
+    );
+    kv(
+        "Max. Speicher",
+        &if cfg.max_storage_gb == 0 { "unbegrenzt".into() } else { format!("{} GB", cfg.max_storage_gb) },
+    );
+    kv("API-Key", &format!("{}…", &cfg.api_key[..14.min(cfg.api_key.len())]));
+    println!();
+}
+
+fn print_manual_start_hint() {
+    println!(
+        "\n{}",
+        style("╔══════════════════════════════════════════════════╗").cyan()
+    );
+    println!(
+        "{}",
+        style("║  Setup abgeschlossen. Node starten mit:          ║").cyan()
+    );
+    println!(
+        "{}",
+        style("║                                                  ║").cyan()
+    );
+    println!(
+        "{}  {}  {}",
+        style("║").cyan(),
+        style("  cargo run --release --bin stone-master         ").green(),
+        style("║").cyan()
+    );
+    println!(
+        "{}",
+        style("║                                                  ║").cyan()
+    );
+    println!(
+        "{}",
+        style("╚══════════════════════════════════════════════════╝").cyan()
+    );
+}
+
+fn truncate_addr(addr: &str) -> String {
+    if addr.len() <= 60 {
+        return addr.to_string();
+    }
+    if let Some(p2p_idx) = addr.rfind("/p2p/") {
+        let peer_id = &addr[p2p_idx + 5..];
+        let prefix = &addr[..p2p_idx];
+        if peer_id.len() > 12 {
+            format!("{}/p2p/{}…", prefix, &peer_id[..12])
+        } else {
+            addr.to_string()
+        }
+    } else {
+        format!("{}…", &addr[..57])
+    }
+}
+
 fn generate_hex(n: usize) -> String {
     let bytes: Vec<u8> = (0..n).map(|_| rand::thread_rng().gen::<u8>()).collect();
     hex::encode(bytes)

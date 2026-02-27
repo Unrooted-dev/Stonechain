@@ -44,11 +44,6 @@ base64  = "0.21"
 tokio   = { version = "1", features = ["full"] }
 bytes   = "1.0"
 
-# TLS
-rustls          = "0.23"
-tokio-rustls    = "0.26"
-rustls-pemfile  = "2.1"
-
 # HTTP-Server (axum – Master Node API + Auth Server)
 axum        = { version = "0.7", features = ["macros", "json", "multipart", "ws"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
@@ -59,7 +54,6 @@ reqwest = { version = "0.11", default-features = false, features = ["json", "rus
 
 # Auth / Krypto
 bip39           = { version = "1.2", default-features = false, features = ["std", "rand"] }
-x509-parser     = "0.16"
 rcgen           = "0.12"
 pbkdf2          = { version = "0.12", features = ["hmac"] }
 # Ed25519 Schlüsselpaar, Signierung und Verifikation

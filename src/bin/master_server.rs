@@ -30,7 +30,7 @@
 #[path = "server/mod.rs"]
 mod server;
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc};
 
 use stone::{
     auth::load_users,
@@ -43,7 +43,7 @@ use stone::{
 use server::{
     router::build_router,
     state::{load_api_key, load_peers_from_disk, load_trust_from_disk, AppState, HEARTBEAT_INTERVAL},
-    sync::{announce_public_url, fetch_missing_chunks, pull_from_peer, spawn_auto_sync_task},
+    sync::{fetch_missing_chunks, pull_from_peer, spawn_auto_sync_task},
 };
 
 #[tokio::main]
@@ -57,35 +57,6 @@ async fn main() {
 
     std::fs::create_dir_all(data_dir()).expect("DATA_DIR anlegen");
     ChunkStore::new().expect("ChunkStore anlegen");
-
-    // Embedded-CA sicherstellen — falls noch keine Root-CA existiert, wird sie
-    // jetzt erzeugt und liegt bereit für TLS. Wenn TLS nicht aktiviert ist,
-    // schadet es nichts (root.key bleibt einfach ungenutzt).
-    let ca_existed_before = stone::auth::find_embedded_ca().is_some();
-    if let Err(e) = stone::auth::ensure_embedded_ca() {
-        eprintln!("[master] Warnung: CA-Initialisierung fehlgeschlagen: {e}");
-    }
-    let ca_was_new = !ca_existed_before && stone::auth::find_embedded_ca().is_some();
-
-    // CA-Fingerprint beim Start loggen — wichtig für Cluster-Debugging
-    if let Some((ca_crt_path, _)) = stone::auth::find_embedded_ca() {
-        if let Ok(pem) = std::fs::read_to_string(&ca_crt_path) {
-            use sha2::Digest;
-            let fp = hex::encode(&sha2::Sha256::digest(pem.as_bytes())[..8]);
-            println!("[tls] Root-CA fp: {}… ({})", fp, ca_crt_path);
-            if ca_was_new {
-                println!("[tls] ╔══════════════════════════════════════════════════════════╗");
-                println!("[tls] ║  Neue Root-CA erzeugt. Für Cluster-Betrieb (HTTPS/WSS): ║");
-                println!("[tls] ║                                                          ║");
-                println!("[tls] ║  scp {}/tls/root.crt \\", stone::blockchain::data_dir());
-                println!("[tls] ║      {}/tls/root.key \\", stone::blockchain::data_dir());
-                println!("[tls] ║      user@other-node:/pfad/stone_data/tls/               ║");
-                println!("[tls] ║                                                          ║");
-                println!("[tls] ║  Ohne gleiche Root-CA: TLS-Fehler zwischen Nodes!        ║");
-                println!("[tls] ╚══════════════════════════════════════════════════════════╝");
-            }
-        }
-    }
 
     let api_key = Arc::new(load_api_key());
     let node_id = std::env::var("STONE_NODE_ID")
@@ -250,145 +221,18 @@ async fn main() {
 
     let router = build_router(state);
 
-    // TLS-Konfiguration
-    // Nur TLS aktivieren wenn STONE_TLS_CERT/KEY auf echte Dateien zeigen.
-    // Wenn die Pfade gesetzt sind aber noch nicht existieren →
-    //   automatisch ein self-signed Zertifikat generieren (via ensure_node_certificate).
-    // Wenn die Pfade auf ein Verzeichnis zeigen → Fehler mit klarem Hinweis.
-    let raw_cert = std::env::var("STONE_TLS_CERT").ok();
-    let raw_key  = std::env::var("STONE_TLS_KEY").ok();
-
-    let use_tls = match (&raw_cert, &raw_key) {
-        (Some(c), Some(k)) => {
-            // Verzeichnis angegeben? → Klarer Fehler statt Panic
-            if std::path::Path::new(c).is_dir() {
-                eprintln!("[master] ❌ STONE_TLS_CERT zeigt auf ein Verzeichnis: {c}");
-                eprintln!("[master]    Bitte den vollen Pfad zur .crt-Datei angeben,");
-                eprintln!("[master]    z.B.  STONE_TLS_CERT=stone_data/tls/node.crt");
-                std::process::exit(1);
-            }
-            if std::path::Path::new(k).is_dir() {
-                eprintln!("[master] ❌ STONE_TLS_KEY zeigt auf ein Verzeichnis: {k}");
-                eprintln!("[master]    Bitte den vollen Pfad zur .key-Datei angeben,");
-                eprintln!("[master]    z.B.  STONE_TLS_KEY=stone_data/tls/node.key");
-                std::process::exit(1);
-            }
-            // Dateien noch nicht da? → Self-signed Zertifikat erzeugen
-            if !std::path::Path::new(c).exists() || !std::path::Path::new(k).exists() {
-                println!("[master] TLS-Dateien nicht gefunden – generiere self-signed Zertifikat …");
-                let cfg = stone::auth::NodeCertConfig {
-                    auth_url: std::env::var("STONE_AUTH_URL").ok(),
-                    node_name: std::env::var("STONE_NODE_NAME").unwrap_or_else(|_| "node".into()),
-                    sans: std::env::var("STONE_NODE_SANS")
-                        .ok()
-                        .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
-                        .unwrap_or_default(),
-                    node_url: std::env::var("STONE_NODE_URL").ok(),
-                };
-                match stone::auth::ensure_node_certificate(cfg).await {
-                    Ok(paths) => {
-                        // Env-Vars auf die generierten Pfade umbiegen
-                        std::env::set_var("STONE_TLS_CERT", &paths.cert);
-                        std::env::set_var("STONE_TLS_KEY",  &paths.key);
-                        println!("[master] ✓ Zertifikat bereit: {}", paths.cert);
-                    }
-                    Err(e) => {
-                        eprintln!("[master] ❌ Zertifikat-Generierung fehlgeschlagen: {e}");
-                        std::process::exit(1);
-                    }
-                }
-            }
-            true
-        }
-        _ => false,
-    };
-
     let preferred_port: u16 = std::env::var("STONE_HTTP_PORT")
         .or_else(|_| std::env::var("STONE_PORT"))
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(if use_tls { 443 } else { 8080 });
+        .unwrap_or(8080);
 
-    // ── Cloudflare Tunnel (optional) ──────────────────────────────────────────
-    // Gestartet wenn STONE_TUNNEL=quick oder STONE_TUNNEL=named gesetzt ist.
-    // Läuft in einem eigenen Thread parallel zum Server — blockiert nicht den Start.
-    if stone::tunnel::tunnel_mode_from_env().is_some() {
-        let tunnel_port = preferred_port;
-        let node_ann  = node.clone();
-        let key_ann   = api_key.clone();
-        std::thread::spawn(move || {
-            // Kurz warten bis der Server gebunden hat
-            std::thread::sleep(Duration::from_secs(2));
-            println!("[tunnel] Cloudflare Tunnel wird gestartet…");
-            match stone::tunnel::start_tunnel(tunnel_port) {
-                Ok(handle) => {
-                    println!(
-                        "[tunnel] ✓ Öffentliche URL: {}",
-                        handle.info.public_url
-                    );
-                    std::env::set_var("STONE_PUBLIC_URL", &handle.info.public_url);
-                    // URL an Peers melden (braucht Tokio-Runtime → in neuem Runtime ausführen)
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async move {
-                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                        announce_public_url(node_ann, key_ann).await;
-                    });
-                    // Handle am Leben halten bis Thread endet (= bis Prozess endet)
-                    loop {
-                        std::thread::sleep(Duration::from_secs(60));
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[tunnel] ✗ Tunnel fehlgeschlagen: {e}");
-                    eprintln!("[tunnel]   Node läuft weiter ohne öffentlichen Zugang.");
-                }
-            }
-        });
-    }
-
-    if use_tls {
-        let cert_path = std::env::var("STONE_TLS_CERT").unwrap();
-        let key_path  = std::env::var("STONE_TLS_KEY").unwrap();
-        let addr = SocketAddr::from(([0, 0, 0, 0], preferred_port));
-        println!("[master] HTTPS auf {addr} (TLS: {cert_path})");
-        println!("[master] Stone Master Node läuft auf https://{addr}");
-        println!("[master] Web-UI kann sich via wss://{addr}/ws verbinden");
-
-        axum_server::bind_rustls(
-            addr,
-            axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
-                .await
-                .expect("TLS-Konfiguration laden"),
-        )
-        .serve(router.into_make_service())
-        .await
-        .unwrap_or_else(|e| {
-            if e.to_string().contains("Address already in use") || e.to_string().contains("48") {
-                eprintln!("[master] ❌ Port {preferred_port} ist bereits belegt!");
-                eprintln!("[master]   Lösungen:");
-                eprintln!("[master]   1) Alte Prozesse beenden:  pkill -f stone-master");
-                eprintln!("[master]   2) Anderen Port nutzen:    STONE_PORT={} in .env", preferred_port + 1);
-                std::process::exit(1);
-            }
-            panic!("HTTPS-Server Fehler: {e}");
-        });
-    } else {
-        let listener = bind_with_fallback(preferred_port).await;
-        let bound_port = listener.local_addr().unwrap().port();
-        println!(
-            "[master] HTTP auf 0.0.0.0:{bound_port} (kein TLS – nur für Entwicklung!)"
-        );
-        println!(
-            "[master] Stone Master Node läuft auf http://0.0.0.0:{bound_port}"
-        );
-        println!(
-            "[master] Web-UI kann sich via ws://0.0.0.0:{bound_port}/ws verbinden"
-        );
-        println!(
-            "[master] Hinweis: Für Produktion STONE_TLS_CERT und STONE_TLS_KEY setzen."
-        );
-        axum::serve(listener, router).await.expect("HTTP-Server Fehler");
-    }
+    let listener = bind_with_fallback(preferred_port).await;
+    let bound_port = listener.local_addr().unwrap().port();
+    println!("[master] HTTP auf 0.0.0.0:{bound_port}");
+    println!("[master] Stone Master Node läuft auf http://0.0.0.0:{bound_port}");
+    println!("[master] Web-UI kann sich via ws://0.0.0.0:{bound_port}/ws verbinden");
+    axum::serve(listener, router).await.expect("HTTP-Server Fehler");
 }
 
 /// Bindet an `preferred_port`. Bei Port-Konflikt: harter Fehler statt zufälligem Port.
@@ -399,16 +243,12 @@ async fn bind_with_fallback(preferred_port: u16) -> tokio::net::TcpListener {
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             eprintln!("[master] ❌ Port {preferred_port} ist bereits belegt!");
             eprintln!("[master] Lösungen:");
+            eprintln!("[master]   1) Alte Prozesse beenden:  pkill -f stone-master");
             eprintln!(
-                "[master]   1) Alte Prozesse beenden:  pkill -f stone-master"
-            );
-            eprintln!(
-                "[master]   2) Anderen Port nutzen:    STONE_HTTP_PORT={} cargo run --bin stone-master",
+                "[master]   2) Anderen Port nutzen:    STONE_PORT={} in .env",
                 preferred_port + 1
             );
-            eprintln!(
-                "[master]   3) Belegenden Prozess prüfen: lsof -i :{preferred_port}"
-            );
+            eprintln!("[master]   3) Belegenden Prozess prüfen: lsof -i :{preferred_port}");
             std::process::exit(1);
         }
         Err(e) => panic!("TCP-Bind fehlgeschlagen: {e}"),

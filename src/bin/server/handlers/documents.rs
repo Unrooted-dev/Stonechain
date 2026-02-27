@@ -77,6 +77,112 @@ pub struct TransferDocumentRequest {
     pub to_user_id: String,
 }
 
+// ─── MIME-Type Erkennung ─────────────────────────────────────────────────────
+
+/// Leitet den MIME-Type aus dem Dateinamen ab (Extension-basiert).
+fn guess_mime_from_filename(filename: &str) -> String {
+    let lower = filename.to_lowercase();
+    let ext = lower.rsplit('.').next().unwrap_or("");
+    match ext {
+        // Dokumente
+        "pdf"                          => "application/pdf",
+        "doc"                          => "application/msword",
+        "docx"                         => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls"                          => "application/vnd.ms-excel",
+        "xlsx"                         => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt"                          => "application/vnd.ms-powerpoint",
+        "pptx"                         => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "odt"                          => "application/vnd.oasis.opendocument.text",
+        "ods"                          => "application/vnd.oasis.opendocument.spreadsheet",
+        // Text
+        "txt" | "log" | "md" | "csv"   => "text/plain; charset=utf-8",
+        "html" | "htm"                 => "text/html; charset=utf-8",
+        "css"                          => "text/css",
+        "js"                           => "application/javascript",
+        "json"                         => "application/json",
+        "xml"                          => "application/xml",
+        "yaml" | "yml"                 => "text/yaml",
+        // Bilder
+        "png"                          => "image/png",
+        "jpg" | "jpeg"                 => "image/jpeg",
+        "gif"                          => "image/gif",
+        "svg"                          => "image/svg+xml",
+        "webp"                         => "image/webp",
+        "ico"                          => "image/x-icon",
+        "bmp"                          => "image/bmp",
+        // Audio / Video
+        "mp3"                          => "audio/mpeg",
+        "wav"                          => "audio/wav",
+        "mp4"                          => "video/mp4",
+        "webm"                         => "video/webm",
+        // Archive
+        "zip"                          => "application/zip",
+        "tar"                          => "application/x-tar",
+        "gz" | "tgz"                   => "application/gzip",
+        "7z"                           => "application/x-7z-compressed",
+        "rar"                          => "application/vnd.rar",
+        // Fallback
+        _                              => "application/octet-stream",
+    }
+    .to_string()
+}
+
+/// Erkennt den MIME-Type anhand der ersten Bytes (Magic Bytes / File Signature).
+fn guess_mime_from_magic(data: &[u8]) -> String {
+    if data.len() < 4 {
+        return "application/octet-stream".to_string();
+    }
+    // PDF: %PDF
+    if data.starts_with(b"%PDF") {
+        return "application/pdf".to_string();
+    }
+    // PNG: 89 50 4E 47
+    if data.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+        return "image/png".to_string();
+    }
+    // JPEG: FF D8 FF
+    if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return "image/jpeg".to_string();
+    }
+    // GIF: GIF87a / GIF89a
+    if data.starts_with(b"GIF8") {
+        return "image/gif".to_string();
+    }
+    // WebP: RIFF....WEBP
+    if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
+        return "image/webp".to_string();
+    }
+    // ZIP / DOCX / XLSX / PPTX: PK (50 4B 03 04)
+    if data.starts_with(&[0x50, 0x4B, 0x03, 0x04]) {
+        return "application/zip".to_string();
+    }
+    // GZIP: 1F 8B
+    if data.starts_with(&[0x1F, 0x8B]) {
+        return "application/gzip".to_string();
+    }
+    // BMP: BM
+    if data.starts_with(b"BM") {
+        return "image/bmp".to_string();
+    }
+    // MP4 / MOV: ....ftyp
+    if data.len() >= 8 && &data[4..8] == b"ftyp" {
+        return "video/mp4".to_string();
+    }
+    // HTML
+    if data.starts_with(b"<!DOCTYPE") || data.starts_with(b"<html") || data.starts_with(b"<HTML") {
+        return "text/html; charset=utf-8".to_string();
+    }
+    // JSON
+    if data.starts_with(b"{") || data.starts_with(b"[") {
+        return "application/json".to_string();
+    }
+    // XML
+    if data.starts_with(b"<?xml") {
+        return "application/xml".to_string();
+    }
+    "application/octet-stream".to_string()
+}
+
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
 /// GET /api/v1/documents – Alle aktiven Dokumente (Admin)
@@ -271,6 +377,19 @@ pub async fn handle_get_document_data(
         (doc.clone(), doc.content_type.clone())
     };
 
+    // Bestehende Dokumente mit falschem content_type → aus Titel ableiten
+    let content_type = if content_type == "application/octet-stream" {
+        let guessed = guess_mime_from_filename(&doc_owned.title);
+        if guessed == "application/octet-stream" {
+            // Kein Extension-Match → wird später aus Magic-Bytes ermittelt
+            guessed
+        } else {
+            guessed
+        }
+    } else {
+        content_type
+    };
+
     // ── Dokument-Daten rekonstruieren ────────────────────────────────────────
     // Für Erasure-Coded Dokumente mit P2P: fehlende Shards von Peers holen
     let has_ec_shards = doc_owned.chunks.iter().any(|c| !c.shards.is_empty());
@@ -391,6 +510,13 @@ pub async fn handle_get_document_data(
         format!("attachment; filename=\"{}\"", doc_owned.title)
     };
 
+    // Falls Content-Type immer noch generisch → Magic-Bytes der Datei prüfen
+    let content_type = if content_type == "application/octet-stream" {
+        guess_mime_from_magic(&plaintext)
+    } else {
+        content_type
+    };
+
     Ok(Response::builder()
         .status(200)
         .header("content-type", content_type)
@@ -483,8 +609,16 @@ pub async fn handle_upload_document(
     })?;
 
     let title = title.unwrap_or_else(|| "Untitled".to_string());
-    let content_type =
-        content_type_override.unwrap_or_else(|| "application/octet-stream".to_string());
+    let content_type = {
+        let raw = content_type_override.unwrap_or_else(|| "application/octet-stream".to_string());
+        // Wenn der Browser keinen spezifischen MIME-Type gesendet hat,
+        // versuchen wir ihn aus der Dateiendung abzuleiten.
+        if raw == "application/octet-stream" {
+            guess_mime_from_filename(&title)
+        } else {
+            raw
+        }
+    };
 
     let current_usage = {
         let chain = state.node.chain.lock().unwrap();

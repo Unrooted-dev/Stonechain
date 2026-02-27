@@ -43,7 +43,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         // Health (kein Auth)
         .route("/api/v1/health", get(handle_health))
-        // Öffentliche Node-Info + Tunnel-URL (kein Auth, für Peer-Discovery)
+        // Öffentliche Node-Info (kein Auth, für Peer-Discovery)
         .route("/api/v1/info", get(handle_info))
         // Status & Metriken (Admin)
         .route("/api/v1/status", get(handle_status))
